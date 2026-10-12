@@ -1,151 +1,295 @@
-# GPT-2 From Scratch
+# gpt2-visualizer
 
-A hands-on reimplementation of GPT-2 in PyTorch, built from the ground up and then verified
-against the original OpenAI GPT-2 weights.
+A FastAPI + React app that visualizes the **real** forward pass of a from-scratch
+GPT-2 (124M) implementation, token by token. Nothing in the UI is mocked: every
+number comes from a tensor recorded during an actual forward pass.
 
-The project covers the full loop:
+![Demo — token streaming through the pipeline, attention heatmap and logit lens](docs/demo.gif)
 
-1. Tokenizing raw text into token IDs
-2. Building a sliding-window dataset over those IDs
-3. Implementing the transformer architecture from scratch (no `nn.Transformer`)
-4. Training the model from random initialization on a small corpus
-5. Sampling text with greedy, temperature, and top-k decoding
-6. Downloading the official GPT-2 124M checkpoint and loading it into the from-scratch model
+<!--
+GIF PLACEHOLDER
 
-## Contents
+Record a short demo and drop it at `docs/demo.gif`:
 
-| File | Description |
-| --- | --- |
-| `gpt2.ipynb` | Main notebook: data pipeline, model, training, generation, weight loading |
-| `gpt_download3.py` | Downloads the official GPT-2 checkpoint files and converts the TF checkpoint into a NumPy parameter dict |
-| `the-verdict.txt` | Training corpus — *The Verdict* by Elizabeth Gaskell (~20k tokens) |
-| `requirements.txt` | Python dependencies |
-| `a219f185-211b-4569-9398-2e080e2c5619_1166x1400.jpg` | Reference image used in the project |
+  1. `docker compose up --build`, open http://localhost:8080
+  2. Replay mode -> `effort`. Press play, then click Block 6.
+  3. Switch Attention to `arcs`, pick head 9, click the last token.
+  4. Show the LogitLens rows changing top-1 as depth increases.
 
-## Setup
+Then resize to <=800px wide and under ~4 MB, or reference an external URL:
+
+  ![Demo](https://github.com/user/repo/raw/main/docs/demo.gif)
+
+Tools: `ffmpeg -i capture.mov -vf "fps=12,scale=800:-1" -loop 0 docs/demo.gif`
+or asciinema/svg-term for a terminal recording.
+-->
+
+## Status
+
+| Phase | Scope | State |
+| --- | --- | --- |
+| 1 | `backend/gpt2` pure model package + docs | done |
+| 2 | Tracing: `return_trace`, logit lens, PCA reduction, `generate_stream` | done |
+| 3 | Test suite (shape, numeric contract, HF parity) | done |
+| 4 | FastAPI app, training + export scripts, compose | done |
+| 5 | `frontend` React app | done |
+| 6 | Docs, Docker, static build | done |
+
+## Quick start
+
+### Docker (recommended)
 
 ```bash
+cd gpt2-visualizer
+docker compose up --build
+```
+
+Then open **http://localhost:8080**.
+
+First start takes ~3 minutes: the 500 MB GPT-2 124M checkpoint is downloaded and
+loaded. Subsequent starts are ~30 s. Replay mode works as soon as the frontend is
+up, before the backend finishes loading — the exported traces need no model.
+
+To skip the download and run without the real weights:
+
+```bash
+GPT2_LOAD_OPENAI_MODEL=0 docker compose up --build
+```
+
+`openai-124m` will be listed with `ready: false` and the UI will say why.
+
+### Local development
+
+Two terminals. Backend:
+
+```bash
+cd gpt2-visualizer/backend
+python -m venv .venv && source .venv/Scripts/activate   # Windows
 pip install -r requirements.txt
+python -m scripts.export_traces     # optional, enables replay mode
+uvicorn app.main:app --reload --port 8000
 ```
 
-Dependencies: `numpy`, `torch`, `tensorflow`, `tqdm`, `tiktoken`, `requests`.
+Frontend:
 
-TensorFlow is only needed to read the original GPT-2 checkpoint; it is not used by the model itself.
-The notebook was developed with Python 3.11.
-
-Open `gpt2.ipynb` and run the cells top to bottom.
-
-## Notebook Walkthrough
-
-### 1. Data loading
-
-`GPTDatasetV1` tokenizes the whole text with the GPT-2 BPE tokenizer (`tiktoken.get_encoding("gpt2")`)
-and then uses a sliding window with a configurable `stride` to build overlapping
-`(input_chunk, target_chunk)` pairs. Targets are the inputs shifted by one, which is what makes
-next-token prediction work.
-
-`create_dataloader_v1` wraps this in a PyTorch `DataLoader`. The text is split 75/25 into
-train and validation sets.
-
-### 2. Model architecture
-
-All components are written from scratch in `nn.Module` subclasses:
-
-- **`LayerNorm`** — mean/variance normalization with learnable `scale` and `shift` parameters and
-  `eps = 1e-5`.
-- **`GELU`** — the tanh approximation of the GELU activation.
-- **`MultiHeadAttention`** — scaled dot-product causal self-attention. Q, K, V projections are
-  split into heads, the causal mask is stored as a registered buffer (upper triangular), attention
-  weights are masked with `-inf`, scaled by `sqrt(head_dim)`, passed through softmax and dropout,
-  and finally merged and projected through `out_proj`.
-- **`FeedForward`** — `Linear(emb_dim -> 4 * emb_dim)` → GELU → `Linear(4 * emb_dim -> emb_dim)`.
-- **`TransformerBlock`** — pre-norm architecture: LayerNorm → attention → dropout → residual,
-  then LayerNorm → feed-forward → dropout → residual.
-- **`GPTModel`** — token + learned position embeddings, dropout, `n_layers` transformer blocks,
-  a final layer norm, and a linear output head (tied to the token embedding weights).
-
-### 3. Configuration
-
-```python
-GPT_CONFIG_124M = {
-    "vocab_size":    50257,
-    "context_length": 1024,
-    "emb_dim":        768,
-    "n_heads":        12,
-    "n_layers":       12,
-    "drop_rate":      0.1,
-    "qkv_bias":       True,
-}
+```bash
+cd gpt2-visualizer/frontend
+npm install
+npm run dev            # http://localhost:5173, proxies /api to :8000
 ```
 
-### 4. Training
+### Optional: train the scratch model
 
-- Loss: cross-entropy over flattened logits and targets.
-- Optimizer: `AdamW` with `lr = 4e-4`, `weight_decay = 0.1`.
-- `train_model_simple` tracks tokens seen and evaluates every `eval_freq` steps over `eval_iter`
-  batches, printing a sample generated from `"Every effort moves you"` at the end of each epoch.
-- Run settings: 10 epochs, `batch_size = 2`, sequence length 1024, on CPU.
-- Observed run: loss drops from ~9.57 to ~6.81 over 6 epochs (~5.6 minutes on CPU).
+`scratch-10ep` is a 13.3 M-parameter GPT-2 trained for 10 epochs on *The
+Verdict*, ~35 s on CPU:
 
-### 5. Text generation
+```bash
+cd gpt2-visualizer/backend
+python -m scripts.train_small
+```
 
-Two generators are provided:
+Until it runs, that model is listed with `ready: false` rather than being hidden,
+so the UI can explain the absence instead of silently showing one model.
 
-- `generate_text_simple` — greedy decoding (`argmax`) used during training to print samples.
-- `generate` — full sampler supporting **top-k** filtering (everything below the k-th highest logit
-  is masked to `-inf`) and **temperature** scaling (logits divided by temperature, then
-  `multinomial` sampling). Also supports an optional `eos_id` to stop early.
+## Two ways to run it
 
-Example:
+### Live mode
+
+Needs the backend. Generates over a WebSocket and streams one traced forward pass
+per token:
+
+```bash
+docker compose up --build      # or the local dev setup above
+```
+
+Open the app, pick **Live**, set a prompt, press **Generate**. Each new token
+appends to the context and the whole pipeline animates again over the longer
+sequence. **Stop** closes the socket; the traces already received stay on screen.
+
+### Replay mode
+
+Needs **no backend at all** — this is the static-hosting path. Plays the
+pre-recorded traces in `frontend/public/traces/*.json`:
+
+```bash
+cd gpt2-visualizer/frontend
+npm run dev            # Replay is the default mode
+```
+
+The bundles hold the same `WSStepMessage` payloads the live socket sends, so
+`ModeToggle` swaps the transport and no component changes.
+
+To regenerate them:
+
+```bash
+cd gpt2-visualizer/backend
+python -m scripts.export_traces          # writes frontend/public/traces/*.json
+```
+
+> The traces are **gitignored** — they are 7.8 MB of generated JSON and the
+> exporter needs the backend's dependencies and the 124M checkpoint. Run it once
+> after cloning, or the replay buttons 404. `npm run build:static` checks for
+> them and tells you this if they are missing.
+
+### Building for static hosting
+
+```bash
+cd gpt2-visualizer/frontend
+npm run build:static         # -> dist-static/
+npm run preview:static       # serve it locally at :4173
+```
+
+Upload `dist-static/` to any static host. There is no server component: the
+build has no WebSocket code and makes no `/api` calls, verified by grepping the
+output. Only the mode toggle's **Replay** option is offered, and the comparison
+panel is hidden because it needs two models from the registry.
+
+> `preview:static` runs with proxying explicitly disabled. `vite preview`
+> otherwise falls back to `server.proxy`, so with a backend running on `:8000`
+> it would silently proxy `/api` and make a bundle that is *not* standalone look
+> like it works. If you check `/api/models` while previewing and get the SPA
+> fallback page back rather than JSON, that is the expected result.
+
+For a subpath deploy (GitHub Pages project sites), set the base path in
+`frontend/.env.static` — see `frontend/.env.static.example`.
+
+## Architecture
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │            React app (Vite)                  │
+                    │                                              │
+                    │   ModeToggle ──┬── Live     ──▶ WebSocket     │
+                    │                │                              │
+                    │                └── Replay   ──▶ fetch        │
+                    │                                     │        │
+                    │                        useTraceStore (Zustand) │
+                    │                                     │        │
+                    │   ┌─────────────┬───────────────────┤        │
+                    │   ▼             ▼                   ▼        │
+                    │ Pipeline   BlockDetail        LogitLens       │
+                    │ Tokens→…→Sample  LN→Attn→Add→LN→MLP→Add         │
+                    │   │             │                                │
+                    │   │        AttentionHeatmap / Arcs / HeadSelector│
+                    │   │             │                                │
+                    │   │        TopKChart ──▶ TokenStrip ──▶ loop     │
+                    │   └─────────────┴────────────────────────────────┘
+                    └──────────────┬──────────────────────────┬────────┘
+                     /api/ws/generate                  /traces/*.json
+                                   │                          │
+                    ┌──────────────▼──────────┐    ┌──────────▼─────────┐
+                    │  FastAPI (:8000)        │    │ exported bundles    │
+                    │  registry → gpt2 model  │    │ (gitignored, 7.8MB) │
+                    └──────────────┬──────────┘    └────────────────────┘
+                                   │
+                    ┌──────────────▼──────────────────────────────┐
+                    │  backend/gpt2 — pure model package           │
+                    │  hand-written attention (no F.sdpa, so the    │
+                    │  T×T matrix actually exists to visualize)     │
+                    │  forward(return_trace=True) → Trace           │
+                    └─────────────────────────────────────────────┘
+```
+
+Data flows one way: both sources write `WSStepMessage`s into `useTraceStore`, and
+every component reads the store. Neither component knows which mode is active,
+which is why `ModeToggle` is the only place that changes.
+
+Read [docs/architecture.md](docs/architecture.md) for the model and tracing
+detail, and [docs/trace-schema.md](docs/trace-schema.md) for the JSON contract.
+
+## Layout
+
+```
+gpt2-visualizer/
+├── docs/                 architecture.md, trace-schema.md, demo.gif
+├── notebooks/            the original notebook, untouched
+├── docker-compose.yml    backend + frontend
+├── backend/
+│   ├── gpt2/             pure model package (no web code)
+│   ├── app/              FastAPI: settings, registry, routes
+│   ├── scripts/          train_small.py, export_traces.py
+│   ├── tests/            parity, trace-shape, API route tests
+│   └── checkpoints/      gitignored weights
+└── frontend/
+    ├── src/types/        the JSON contract, mirrored from docs/trace-schema.md
+    ├── src/store/        useTraceStore: steps, current step, selected block/head
+    ├── src/hooks/        useLiveGeneration (WebSocket) and useReplay (bundles)
+    ├── src/components/   Pipeline, BlockDetail, Attention*, LogitLens, TopK, Compare
+    ├── public/traces/    gitignored exported bundles
+    └── Dockerfile        node build -> nginx, proxies /api
+```
+
+## Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/health` | Liveness, device, models ready |
+| `GET` | `/api/models` | Registry listing with `ready` flags |
+| `POST` | `/api/tokenize` | GPT-2 BPE encoding |
+| `POST` | `/api/trace` | One traced forward pass |
+| `WS` | `/api/ws/generate` | Stream one trace per generated token, then `done` |
+
+Two models are registered: `openai-124m` (real OpenAI weights) and `scratch-10ep`
+(from `scripts/train_small.py`, listed as not-ready when its checkpoint is absent).
+
+Interactive reference at http://localhost:8000/docs.
+
+## Tests
+
+```bash
+cd gpt2-visualizer/backend
+pytest                # 168 tests, ~35 s
+pytest -m "not slow"   # 154 tests, ~11 s, no checkpoint needed
+pytest -m slow         # real 124M weights + HuggingFace comparison
+```
+
+```bash
+cd gpt2-visualizer/frontend
+npm run smoke           # renders the real components against the real traces
+npm run smoke:static    # same, against the static-build module graph
+```
+
+`smoke` asserts numeric invariants on all four recorded traces — the causal
+upper triangle is exactly `0.0`, the deepest logit-lens entry equals
+`top_tokens[0]`, sampling candidates sum to 1 within float16 tolerance — then
+renders each component and checks the output. It is not a browser test; see
+[frontend/README.md](frontend/README.md) for what it does and does not cover.
+
+## Using the model directly
 
 ```python
-token_ids = generate(
-    model=gpt,
-    idx=text_to_token_ids("Life is full of", tokenizer).to(device),
-    max_new_tokens=25,
-    context_size=GPT_CONFIG_124M["context_length"],
-    top_k=50,
-    temperatue=1.5,
+from gpt2 import GPTModel, GPT_CONFIG_124M, get_tokenizer
+
+tok = get_tokenizer()
+model = GPTModel(GPT_CONFIG_124M).eval()
+trace = model.forward(
+    torch.tensor([tok.encode("Life is full of")]),
+    return_trace=True, tokenizer=tok, model_id="scratch",
 )
+print(trace.top_pieces[:3])
 ```
 
-### 6. Loading the official GPT-2 weights
+Load the real OpenAI weights:
 
-`gpt_download3.py` provides:
+```python
+from gpt2 import download_and_load_gpt2, load_weights_into_gpt
 
-- `download_and_load_gpt2(model_size, models_dir)` — validates the model size against
-  `124M / 355M / 774M / 1558M`, downloads the checkpoint, `encoder.json`, `hparams.json` and
-  `vocab.bpe` from OpenAI's public blob storage into `models_dir/model_size/`, skips files that
-  are already up to date (by comparing sizes), then loads settings and parameters.
-- `download_file(url, destination)` — streamed download with a `tqdm` progress bar.
-- `load_gpt2_params_from_tf_ckpt(ckpt_path, settings)` — walks the TensorFlow checkpoint variables
-  and rebuilds a nested dictionary keyed by layer index, so the OpenAI naming (`wte`, `wpe`,
-  `blocks.N.attn.c_attn`, `blocks.N.mlp.c_fc`, `blocks.N.ln_1`, …) becomes an easy-to-navigate dict.
-
-In the notebook, `assign` checks shape compatibility and `load_weights_into_gpt` copies every tensor
-into the `GPTModel`:
-
-- `wte` → token embedding and the (tied) output head; `wpe` → position embedding
-- `attn/c_attn` weights and biases are split in three for Q, K, V and transposed to PyTorch layout
-- `attn/c_proj` → attention output projection
-- `mlp/c_fc` and `mlp/c_proj` → the two feed-forward layers
-- `ln_1`, `ln_2`, and the final `g`/`b` → LayerNorm scale and shift
-
-The result is that the from-scratch implementation reproduces GPT-2 124M exactly. Generating with
-the pretrained weights gives coherent text, e.g.
-
-```
-Life is full of new problems at work, when I'm forced to choose the right word to describe
-how one finds the person I love and work
+model = GPTModel(GPT_CONFIG_124M).eval()
+_, params = download_and_load_gpt2("124M", "checkpoints/gpt2", reuse_existing=True)
+load_weights_into_gpt(model, params)
 ```
 
-compared to the near-gibberish produced by the same model trained from scratch for a few epochs.
+Stream a generation with a trace per token:
 
-## Notes
+```python
+from gpt2 import generate_stream
 
-- The notebook imports `tqdm` and `tensorflow` directly in the first cell even though they are only
-  used by `gpt_download3.py`.
-- `download_file` uses `verify=False`, so `urllib3` prints an `InsecureRequestWarning` on each
-  request. Enable certificate verification if that matters in your environment.
-- Training runs on CPU (`device = torch.device("cpu")`); switch to `cuda` if available for faster
-  epochs.
+for step in generate_stream(model, prompt="Every effort moves you",
+                            max_new_tokens=5, temperature=0.9, top_k=50):
+    print(step.step, repr(step.piece), step.trace.logit_lens[-1].top_pieces[0])
+```
+
+## Source
+
+Derived from the from-scratch implementation in `notebooks/gpt2.ipynb`, itself
+following *Build a Large Language Model (From Scratch)* by Sebastian Raschka.
