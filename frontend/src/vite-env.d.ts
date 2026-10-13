@@ -2,7 +2,7 @@
 
 interface ImportMetaEnv {
   /** Empty in dev, where Vite proxies `/api`; an origin in a static deploy. */
-  readonly VITE_API_BASE?: string;
+  readonly VITE_API_URL?: string;
 }
 
 interface ImportMeta {

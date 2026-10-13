@@ -211,7 +211,6 @@ export function useCompareRun(ready: ModelInfo[]): CompareRun {
           } catch {
             return;
           }
-          if (msg.request_id !== requestId) return;
           if (msg.type === 'step') {
             // Keep the *first* trace: it is the one over the bare prompt, which
             // is what both sides must be compared on.
@@ -219,6 +218,8 @@ export function useCompareRun(ready: ModelInfo[]): CompareRun {
             text = msg.text;
           } else if (msg.type === 'error') {
             settle({ modelId, label, text, trace, error: msg.message, pending: false });
+          } else if (msg.type === 'done') {
+            settle({ modelId, label, text, trace, error: null, pending: false });
           }
         };
 

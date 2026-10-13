@@ -2,7 +2,7 @@ import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import { fileURLToPath, URL } from 'node:url';
 
-const BACKEND = process.env.VITE_BACKEND_ORIGIN ?? 'http://localhost:8000';
+
 
 const SRC = fileURLToPath(new URL('./src', import.meta.url));
 
@@ -30,7 +30,7 @@ export default defineConfig(({ mode }) => {
   // `loadEnv` is needed because `base` is resolved in Node, not in the client
   // bundle: VITE_BASE lives in `.env.static` and must be read here too.
   const env = loadEnv(mode, process.cwd(), 'VITE_');
-
+  const BACKEND = env.VITE_API_URL ?? process.env.VITE_BACKEND_ORIGIN ?? 'http://localhost:8000';
   return {
     plugins: [react()],
     resolve: {

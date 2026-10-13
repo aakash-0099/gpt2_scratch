@@ -21,7 +21,7 @@ import type {
 
 import { STATIC_ONLY } from './env';
 
-const RAW_BASE = (import.meta.env.VITE_API_BASE ?? '').replace(/\/$/, '');
+const RAW_BASE = (import.meta.env.VITE_API_URL ?? '').replace(/\/$/, '');
 
 export const API_BASE = RAW_BASE;
 

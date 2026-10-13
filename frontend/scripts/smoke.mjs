@@ -55,7 +55,7 @@ await build({
     // warnings are noise here and the assertions are the signal.
     'process.env.NODE_ENV': '"production"',
     // Vite injects these; esbuild does not, so supply the same defaults.
-    'import.meta.env.VITE_API_BASE': '""',
+    'import.meta.env.VITE_API_URL': '""',
     'import.meta.env.BASE_URL': '""',
     // `production` matches a normal `vite build`, which is the mode the smoke
     // check asserts against. `src/lib/env.ts` reads this to derive STATIC_ONLY.
