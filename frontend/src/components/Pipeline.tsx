@@ -22,6 +22,8 @@ export function Pipeline() {
   const trace = useTraceStore(selectCurrentTrace);
   const step = useTraceStore(selectCurrentStep);
   const status = useTraceStore((s) => s.status);
+  const steps = useTraceStore((s) => s.steps);
+  const maxNewTokens = useTraceStore((s) => s.maxNewTokens);
   const selectBlock = useTraceStore((s) => s.selectBlock);
 
   const stages = pipelineStages(trace);
@@ -76,21 +78,22 @@ export function Pipeline() {
             className="border-t border-ink-700 px-3 py-2 text-xs text-slate-400"
           >
             step{' '}
-            <span className="value text-slate-200">{step.step}</span> · context{' '}
-            <span className="value text-slate-200">{step.token_ids.length}</span> tokens ·
+            <span className="value text-slate-200">{step.step + 1}</span> of{' '}
+            <span className="value text-slate-200">{maxNewTokens ?? steps.length}</span> · context{' '}
+            <span className="value text-slate-200">{trace?.input_token_ids.length ?? 0}</span> tokens ·
             sampled{' '}
             <span className="value text-accent-400">{JSON.stringify(step.piece)}</span>
-            {trace?.sampling && !trace.sampling.greedy && (
+            {trace?.sampling && !trace.sampling.was_argmax && (
               <>
                 {' '}
                 at{' '}
                 <span className="value text-slate-200">
-                  {formatPercent(trace.sampling.sampled_prob, 1)}
+                  {formatPercent(trace.sampling.chosen.p_final, 1)}
                 </span>{' '}
                 after temperature {formatFixed(trace.sampling.temperature, 2)}
               </>
             )}
-            {trace?.sampling?.greedy && <> (greedy: argmax)</>}
+            {trace?.sampling?.temperature === 0 && <> (argmax: no draw)</>}
           </motion.p>
         )}
       </AnimatePresence>
@@ -187,7 +190,7 @@ function SamplingBadge({ trace }: { trace: Trace | null }) {
   const sampling = trace?.sampling;
   if (!sampling) return <span>S</span>;
   return (
-    <span className="value text-[10px] text-accent-400">{formatPercent(sampling.sampled_prob, 0)}</span>
+    <span className="value text-[10px] text-accent-400">{formatPercent(sampling.chosen.p_final, 0)}</span>
   );
 }
 

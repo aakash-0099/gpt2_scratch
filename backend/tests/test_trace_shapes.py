@@ -164,7 +164,9 @@ def test_tokens_ids_and_pieces(d, fixture):
 @pytest.mark.parametrize("key", ["token_emb", "pos_emb", "emb_sum", "final_norm"])
 def test_embedding_series_shape(d, fixture, key):
     s = d[key]
-    assert set(s) == {"norms", "pca", "shape", "explained_variance"}
+    assert set(s) == {
+        "norms", "pca", "shape", "explained_variance", "delta_norms"
+    }
     assert len(s["norms"]) == fixture["n"]
     assert len(s["pca"]) == fixture["n"]
     assert all(len(p) == 2 for p in s["pca"])
@@ -180,18 +182,48 @@ def test_no_raw_embedding_vectors_shipped(d, fixture):
         assert all(len(p) == 2 for p in s["pca"]), key
 
 
-def test_pca_basis_is_shared_across_the_trace(d):
-    """A single basis per trace, so layers are comparable in one frame."""
-    bases = [d[k]["explained_variance"] for k in ("token_emb", "pos_emb", "emb_sum")]
-    for b in d["blocks"]:
-        bases.extend([b["ln1_out"]["explained_variance"], b["resid_after_mlp"]["explained_variance"]])
-    assert all(b == bases[0] for b in bases)
+def test_pca_explained_variance_is_per_tensor(d):
+    """The shared axes capture different fractions of variance by activation."""
+    series = [
+        d["blocks"][0][key]
+        for key in ("ln1_out", "resid_after_attn", "ln2_out", "resid_after_mlp")
+    ]
+    values = [tuple(s["explained_variance"]) for s in series]
+    assert len(set(values)) > 1, values
 
 
 def test_pca_explained_variance_is_a_fraction(d):
-    ev = d["emb_sum"]["explained_variance"]
-    assert all(0.0 <= v <= 1.0 for v in ev)
-    assert sum(ev) <= 1.0001
+    series = [d["emb_sum"]] + [
+        block[key]
+        for block in d["blocks"]
+        for key in ("ln1_out", "resid_after_attn", "ln2_out", "resid_after_mlp")
+    ]
+    for item in series:
+        ev = item["explained_variance"]
+        assert all(0.0 <= v <= 1.0 for v in ev)
+        assert sum(ev) <= 1.0001
+
+
+def test_block_deltas_use_stage_input_baselines(d):
+    block_input = d["emb_sum"]["norms"]
+    for block in d["blocks"]:
+        expected = {
+            "ln1_out": block_input,
+            "resid_after_attn": block_input,
+            "ln2_out": block["resid_after_attn"]["norms"],
+            "resid_after_mlp": block["resid_after_attn"]["norms"],
+        }
+        for key, baseline in expected.items():
+            current = block[key]
+            wanted = [
+                round(value - previous, 4)
+                for value, previous in zip(current["norms"], baseline)
+            ]
+            assert all(
+                abs(actual - expected) <= 0.00011
+                for actual, expected in zip(current["delta_norms"], wanted)
+            ), (block["index"], key, current["delta_norms"], wanted)
+        block_input = block["resid_after_mlp"]["norms"]
 
 
 def test_embedding_norms_are_positive(d):
@@ -363,29 +395,55 @@ def test_top_k_at_last_position(d):
 # --------------------------------------------------------------------------- #
 
 
-def test_logit_lens_one_entry_per_block(d):
-    assert len(d["logit_lens"]) == N_LAYERS
-    assert [e["layer"] for e in d["logit_lens"]] == list(range(N_LAYERS))
+def test_logit_lens_has_embedding_and_one_entry_per_block(d):
+    assert len(d["logit_lens"]) == N_LAYERS + 1
+    assert [e["layer"] for e in d["logit_lens"]] == [
+        "emb", *range(1, N_LAYERS + 1)
+    ]
 
 
 def test_logit_lens_entry_fields(d):
     for e in d["logit_lens"]:
-        assert set(e) == {"layer", "top_tokens", "top_pieces", "top_probs"}
-        assert len(e["top_tokens"]) == 5
-        assert len(e["top_pieces"]) == 5
-        assert len(e["top_probs"]) == 5
-        assert e["top_probs"] == sorted(e["top_probs"], reverse=True)
+        assert set(e) == {
+            "layer", "positions", "final_token_prob", "final_token_rank", "entropy"
+        }
+        assert len(e["positions"]) == len(d["input_token_ids"])
+        assert all(len(p["top_tokens"]) == 3 for p in e["positions"])
+        assert all(len(p["top_pieces"]) == 3 for p in e["positions"])
+        assert all(len(p["top_probs"]) == 3 for p in e["positions"])
+        assert all(
+            p["top_probs"] == sorted(p["top_probs"], reverse=True)
+            for p in e["positions"]
+        )
 
 
 def test_logit_lens_last_entry_equals_real_prediction(d):
     """The deepest lens read-out is the model's actual next-token prediction."""
-    assert d["logit_lens"][-1]["top_tokens"] == d["top_tokens"]
-    assert d["logit_lens"][-1]["top_pieces"] == d["top_pieces"]
+    last_position = d["logit_lens"][-1]["positions"][-1]
+    assert last_position["top_tokens"] == d["top_tokens"][:3]
+    assert last_position["top_pieces"] == d["top_pieces"][:3]
+    assert d["logit_lens"][-1]["final_token_rank"] == 1
+
+
+def test_final_lens_top_three_matches_actual_probabilities(fixture, d):
+    model = fixture["model"]
+    inputs = torch.tensor([fixture["ids"]], dtype=torch.long)
+    with torch.no_grad():
+        actual = torch.softmax(model(inputs)[0].float(), dim=-1)
+    final_positions = d["logit_lens"][-1]["positions"]
+    for position, entry in enumerate(final_positions):
+        expected = actual[position, entry["top_tokens"]].tolist()
+        assert torch.allclose(
+            torch.tensor(entry["top_probs"]),
+            torch.tensor(expected),
+            atol=0.000051,
+            rtol=0,
+        )
 
 
 def test_logit_lens_differs_across_depth(d):
     """If every depth gave the same answer the lens would be meaningless."""
-    all_top = [tuple(e["top_tokens"]) for e in d["logit_lens"]]
+    all_top = [tuple(e["positions"][-1]["top_tokens"]) for e in d["logit_lens"]]
     assert len(set(all_top)) > 1, all_top
 
 
@@ -460,17 +518,19 @@ def test_124m_attention_upper_triangle_is_exactly_zero(trace_124m):
         )
 
 
-def test_124m_logit_lens_has_exactly_12_entries(trace_124m):
+def test_124m_logit_lens_has_embedding_and_12_blocks(trace_124m):
     entries = trace_124m["trace"].logit_lens
-    assert len(entries) == 12
-    assert [e.layer for e in entries] == list(range(12))
+    assert len(entries) == 13
+    assert entries[0].layer == "emb"
+    assert [e.layer for e in entries] == ["emb", *range(1, 13)]
 
 
 def test_124m_logit_lens_last_entry_is_the_real_prediction(trace_124m):
     trace = trace_124m["trace"]
-    assert trace.logit_lens[-1].layer == 11
-    assert trace.logit_lens[-1].top_tokens == trace.top_tokens
-    assert trace.logit_lens[-1].top_pieces == trace.top_pieces
+    assert trace.logit_lens[-1].layer == 12
+    assert trace.logit_lens[-1].positions[-1].top_tokens == trace.top_tokens[:3]
+    assert trace.logit_lens[-1].positions[-1].top_pieces == trace.top_pieces[:3]
+    assert trace.logit_lens[-1].final_token_rank == 1
 
 
 def test_124m_position_predictions_cover_all_positions(trace_124m):
@@ -498,7 +558,7 @@ def test_124m_generate_stream_yields_twelve_block_traces():
     trace = steps[0].trace
     assert len(trace.blocks) == 12
     assert len(trace.blocks[0].heads) == 12
-    assert len(trace.logit_lens) == 12
+    assert len(trace.logit_lens) == 13
     assert trace.sampling is not None
 
 
@@ -680,9 +740,11 @@ def test_greedy_picks_top_candidate(fixture):
     for s in steps:
         sp = s.sampling
         assert sp.greedy is True
-        best = max(sp.candidates, key=lambda c: c.prob)
-        assert sp.sampled_token_id == best.token_id
-        assert abs(sp.sampled_prob - best.prob) < 1e-3
+        best = max(sp.candidates, key=lambda c: c.p_final)
+        assert sp.chosen.id == best.id
+        assert abs(sp.chosen.p_final - best.p_final) < 1e-3
+        assert sp.was_argmax is True
+        assert sp.u is None
 
 
 def test_top_k_limits_candidate_count(fixture):
@@ -692,7 +754,7 @@ def test_top_k_limits_candidate_count(fixture):
             temperature=1.0, top_k=5, tokenizer=fixture["tok"], seed=2,
         )
     )
-    assert len(steps[0].sampling.candidates) == 5
+    assert len(steps[0].sampling.candidates) == 50
 
 
 def test_candidates_sorted_and_probabilities_sum_to_one(fixture):
@@ -703,10 +765,11 @@ def test_candidates_sorted_and_probabilities_sum_to_one(fixture):
         )
     )
     sp = steps[0].sampling
-    probs = [c.prob for c in sp.candidates]
-    assert probs == sorted(probs, reverse=True)
-    # After top-k filtering, renormalized probabilities cover the whole set.
-    assert abs(sum(probs) - 1.0) < 1e-3
+    kept_probs = [c.p_final for c in sp.candidates if c.kept]
+    assert abs(sum(kept_probs) - 1.0) < 1e-3
+    assert all(c.p_final == 0.0 for c in sp.candidates if not c.kept)
+    assert sp.u is not None
+    assert sp.cdf_lo <= sp.u < sp.cdf_hi
 
 
 def test_sampling_fields_present(fixture):
@@ -719,11 +782,14 @@ def test_sampling_fields_present(fixture):
     sp = steps[0].sampling
     assert sp.temperature == 0.7
     assert sp.top_k == 8
-    assert sp.greedy is False
+    assert sp.seed == 4
+    assert sp.was_argmax is False
     assert sp.eos_hit is False
     assert sp.sampled_piece
     for c in sp.candidates:
-        assert set(c.__dataclass_fields__) == {"token_id", "piece", "logit", "prob"}
+        assert set(c.__dataclass_fields__) == {
+            "rank", "id", "token", "logit", "p_raw", "p_temp", "kept", "p_final"
+        }
 
 
 def test_sampling_appears_in_serialized_trace(fixture):
@@ -735,8 +801,63 @@ def test_sampling_appears_in_serialized_trace(fixture):
     )
     d = steps[0].trace.to_dict()
     assert d["sampling"]["step"] == 0
-    assert len(d["sampling"]["candidates"]) == 4
-    assert d["sampling"]["sampled_token_id"] == steps[0].token_id
+    assert len(d["sampling"]["candidates"]) == 50
+    assert d["sampling"]["chosen"]["id"] == steps[0].token_id
+    assert d["sampling"]["u"] is None
+    assert d["sampling"]["was_argmax"] is True
+
+
+def test_stream_sampling_seed_reproduces_tokens(fixture):
+    def run():
+        return [
+            step.token_id
+            for step in generate_stream(
+                fixture["model"], prompt=PROMPT, max_new_tokens=4,
+                temperature=0.8, top_k=20, tokenizer=fixture["tok"], seed=73,
+            )
+        ]
+
+    assert run() == run()
+
+
+def test_sampling_draw_lands_inside_chosen_cdf_interval(fixture):
+    step = next(
+        generate_stream(
+            fixture["model"], prompt=PROMPT, max_new_tokens=1,
+            temperature=0.8, top_k=12, tokenizer=fixture["tok"], seed=74,
+        )
+    )
+    sampling = step.sampling
+    assert sampling.u is not None
+    assert sampling.cdf_lo <= sampling.u < sampling.cdf_hi
+    assert sampling.chosen.p_final > 0
+
+
+def test_sampling_probability_mass_and_non_kept_candidates(fixture):
+    sampling = next(
+        generate_stream(
+            fixture["model"], prompt=PROMPT, max_new_tokens=1,
+            temperature=0.8, top_k=12, tokenizer=fixture["tok"], seed=75,
+        )
+    ).sampling
+    kept = [candidate for candidate in sampling.candidates if candidate.kept]
+    assert abs(sum(candidate.p_final for candidate in kept) - 1.0) < 1e-3
+    assert all(candidate.p_final == 0.0 for candidate in sampling.candidates if not candidate.kept)
+
+
+def test_temperature_zero_is_argmax_without_draw(fixture):
+    sampling = next(
+        generate_stream(
+            fixture["model"], prompt=PROMPT, max_new_tokens=1,
+            temperature=0.0, top_k=12, tokenizer=fixture["tok"], seed=76,
+        )
+    ).sampling
+    assert sampling.was_argmax is True
+    assert sampling.chosen.id == sampling.greedy_id
+    assert sampling.u is None
+    assert sampling.cdf_lo is None
+    assert sampling.cdf_hi is None
+    assert sampling.entropy_final == 0.0
 
 
 def test_temperature_scales_probabilities(fixture):

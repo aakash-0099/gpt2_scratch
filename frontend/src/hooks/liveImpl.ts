@@ -74,7 +74,11 @@ export function useLiveGeneration(): LiveGeneration {
       clearRate();
 
       const requestId = `live-${Date.now().toString(36)}-${++requestCounter}`;
-      startRun({ modelId: opts.model_id, prompt: opts.prompt });
+      startRun({
+        modelId: opts.model_id,
+        prompt: opts.prompt,
+        maxNewTokens: opts.max_new_tokens,
+      });
 
       const request = buildGenerateRequest(requestId, {
         model_id: opts.model_id,

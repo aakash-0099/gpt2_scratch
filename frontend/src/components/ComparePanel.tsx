@@ -19,10 +19,12 @@ import type { LogitLensEntry, Trace } from '@/types/trace';
 
 import { useCompareRun } from '@/hooks/useCompareRun';
 import { LogitLensStrip } from '@/components/LogitLens';
+import { useTraceStore } from '@/store/useTraceStore';
 
 export function ComparePanel() {
   const { models, ready, loading, offline } = useModels();
   const run = useCompareRun(ready);
+  const selectedPosition = useTraceStore((s) => s.selectedPosition);
 
   return (
     <section className="panel" aria-label="Model comparison">
@@ -159,6 +161,7 @@ export function ComparePanel() {
                 layer={run.layer}
                 head={run.head}
                 other={run.resultB?.trace ?? null}
+                selectedPosition={selectedPosition}
               />
               <CompareSide
                 title={run.modelB}
@@ -166,6 +169,7 @@ export function ComparePanel() {
                 layer={run.layer}
                 head={run.head}
                 other={run.resultA?.trace ?? null}
+                selectedPosition={selectedPosition}
               />
             </div>
           </>
@@ -190,12 +194,14 @@ function CompareSide({
   layer,
   head,
   other,
+  selectedPosition,
 }: {
   title: string;
   result: SideResult | null;
   layer: number;
   head: number;
   other: Trace | null;
+  selectedPosition: number | null;
 }) {
   if (!result) {
     return (
@@ -224,7 +230,12 @@ function CompareSide({
   const headData = block?.heads[head] ?? null;
   const lens = trace?.logit_lens ?? [];
   const deepest = lens[lens.length - 1] ?? null;
-  const agreement = topPiecesAgree(trace, other, layer);
+  const position = Math.min(
+    selectedPosition ?? (trace?.input_token_ids.length ?? 1) - 1,
+    (trace?.input_token_ids.length ?? 1) - 1,
+  );
+  const agreement = topPiecesAgree(trace, other, layer, position);
+  const deepestPosition = deepest?.positions[deepest.positions.length - 1];
 
   return (
     <motion.div
@@ -236,8 +247,8 @@ function CompareSide({
         <h3 className="text-xs font-semibold text-slate-200">{result.label || result.modelId}</h3>
         {deepest && (
           <span className="value text-[11px] text-accent-400">
-            top {JSON.stringify(deepest.top_pieces[0] ?? '')} ·{' '}
-            {formatPercent(deepest.top_probs[0] ?? 0, 1)}
+            top {JSON.stringify(deepestPosition?.top_pieces[0] ?? '')} ·{' '}
+            {formatPercent(deepestPosition?.top_probs[0] ?? 0, 1)}
           </span>
         )}
       </div>
@@ -261,12 +272,19 @@ function CompareSide({
           label="logit max"
           value={formatCompact(trace?.logits.max ?? 0, 1)}
         />
-        <Metric label="lens top-1" value={lensEntryOf(lens, layer)?.top_pieces[0] ?? '—'} />
+        <Metric
+          label="lens top-1"
+          value={lensEntryOf(lens, layer)?.positions[position]?.top_pieces[0] ?? '—'}
+        />
       </div>
 
       {/* Where this model's prediction forms, layer by layer. */}
       <div className="border-t border-ink-800 pt-2">
-        <LogitLensStrip trace={trace} label={`logit lens · ${lens.length} layers`} />
+        <LogitLensStrip
+          trace={trace}
+          position={position}
+          label={`logit lens · ${lens.length} depths`}
+        />
       </div>
 
       {/* The head's strongest key target, next to the other model's. */}
@@ -318,15 +336,23 @@ function Metric({ label, value }: { label: string; value: string }) {
 }
 
 function lensEntryOf(lens: LogitLensEntry[], layer: number): LogitLensEntry | undefined {
-  return lens.find((e) => e.layer === layer) ?? lens[layer];
+  return lens.find((entry) => entry.layer === layer + 1);
 }
 
 /** Do both models' lenses agree on the top token at this depth? */
-function topPiecesAgree(a: Trace | null, b: Trace | null, layer: number): boolean | null {
+function topPiecesAgree(
+  a: Trace | null,
+  b: Trace | null,
+  layer: number,
+  position: number,
+): boolean | null {
   const ea = lensEntryOf(a?.logit_lens ?? [], layer);
   const eb = lensEntryOf(b?.logit_lens ?? [], layer);
   if (!ea || !eb) return null;
-  return (ea.top_pieces[0] ?? null) === (eb.top_pieces[0] ?? null);
+  return (
+    (ea.positions[position]?.top_pieces[0] ?? null) ===
+    (eb.positions[position]?.top_pieces[0] ?? null)
+  );
 }
 
 /**
@@ -339,7 +365,12 @@ function divergenceNote(a: Trace | null, b: Trace | null): string {
   if (!a || !b) return '';
   const len = Math.min(a.logit_lens.length, b.logit_lens.length);
   for (let i = 0; i < len; i += 1) {
-    if ((a.logit_lens[i].top_pieces[0] ?? '') !== (b.logit_lens[i].top_pieces[0] ?? '')) {
+    const aPositions = a.logit_lens[i].positions;
+    const bPositions = b.logit_lens[i].positions;
+    if (
+      (aPositions[aPositions.length - 1]?.top_pieces[0] ?? '') !==
+      (bPositions[bPositions.length - 1]?.top_pieces[0] ?? '')
+    ) {
       return `first lens disagreement at layer ${i + 1}`;
     }
   }

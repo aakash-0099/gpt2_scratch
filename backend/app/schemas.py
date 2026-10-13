@@ -44,7 +44,11 @@ class VectorSeries(BaseModel):
     )
     shape: list[int] = Field(..., description="Source shape, [1, T, emb_dim].")
     explained_variance: list[float] = Field(
-        ..., description="Length 2, variance captured by each PCA axis."
+        ..., description="Length 2, this tensor's variance captured by each PCA axis."
+    )
+    delta_norms: list[float] | None = Field(
+        default=None,
+        description="Per-position L2 norm change from the operation's actual input.",
     )
 
 
@@ -117,17 +121,27 @@ class BlockTrace(BaseModel):
     resid_after_mlp: VectorSeries
 
 
-class LogitLensEntry(BaseModel):
-    """Predictions read out of the residual stream at one block depth."""
+class LogitLensPosition(BaseModel):
+    """Top tokens from one lens distribution at one prompt position."""
 
     model_config = ConfigDict(extra="forbid")
 
-    layer: int
+    position: int
     top_tokens: list[int]
     top_pieces: list[str]
-    top_probs: list[float] = Field(
-        ..., description="Softmax probabilities at the last prompt position."
-    )
+    top_probs: list[float] = Field(..., description="Top-three probabilities.")
+
+
+class LogitLensEntry(BaseModel):
+    """Readout through the final LayerNorm and output head at one depth."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    layer: int | Literal["emb"]
+    positions: list[LogitLensPosition]
+    final_token_prob: float
+    final_token_rank: int
+    entropy: float
 
 
 class PositionPrediction(BaseModel):
@@ -142,33 +156,57 @@ class PositionPrediction(BaseModel):
 
 
 class SamplingCandidate(BaseModel):
-    """One surviving candidate in the sampling step's distribution."""
+    """One token in the traceable portion of the sampling distribution."""
 
     model_config = ConfigDict(extra="forbid")
 
-    token_id: int
-    piece: str
+    rank: int
+    id: int
+    token: str
     logit: float
-    prob: float
+    p_raw: float
+    p_temp: float
+    kept: bool
+    p_final: float
+
+
+class SamplingTail(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    p_raw: float
+    p_temp: float
+
+
+class ChosenToken(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rank: int
+    id: int
+    token: str
+    p_raw: float
+    p_final: float
 
 
 class SamplingStep(BaseModel):
-    """The sampling decision made after one forward pass.
-
-    ``candidates`` hold probabilities recomputed *after* temperature scaling,
-    i.e. exactly the distribution the token was drawn from.
-    """
+    """Complete per-step record of the sampling distribution and draw."""
 
     model_config = ConfigDict(extra="forbid")
 
     step: int
     temperature: float
     top_k: int | None
-    greedy: bool
+    seed: int | None
     candidates: list[SamplingCandidate]
-    sampled_token_id: int
-    sampled_piece: str
-    sampled_prob: float
+    tail: SamplingTail
+    topk_mass_kept: float
+    entropy_raw: float
+    entropy_final: float
+    u: float | None
+    cdf_lo: float | None
+    cdf_hi: float | None
+    chosen: ChosenToken
+    greedy_id: int
+    was_argmax: bool
     eos_id: int | None
     eos_hit: bool
 
@@ -256,7 +294,7 @@ class TraceRequest(BaseModel):
     model_id: str = "openai-124m"
     token_ids: list[int] = Field(..., min_length=1)
     mlp_top_k: int = Field(default=20, ge=1, le=100)
-    lens_top_k: int = Field(default=5, ge=1, le=50)
+    lens_top_k: int = Field(default=3, ge=1, le=3)
 
 
 class WSGenerateRequest(BaseModel):

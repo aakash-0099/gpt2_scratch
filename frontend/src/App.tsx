@@ -19,7 +19,10 @@ import { ModeToggle } from '@/components/ModeToggle';
 import { Pipeline } from '@/components/Pipeline';
 import { LiveStatus, ReplayControls } from '@/components/ReplayControls';
 import { TokenStrip } from '@/components/TokenStrip';
-import { TopKChart } from '@/components/TopKChart';
+import { DrawStrip } from '@/components/sampling/DrawStrip';
+import { SamplingFunnel } from '@/components/sampling/SamplingFunnel';
+import { SamplingHistory } from '@/components/sampling/SamplingHistory';
+import { SamplingStats } from '@/components/sampling/SamplingStats';
 
 import { useLiveGeneration } from '@/hooks/useLiveGeneration';
 import { useReplay } from '@/hooks/useReplay';
@@ -41,6 +44,9 @@ export function App() {
   const head = useTraceStore(selectSelectedHead);
   const queryPosition = useTraceStore((s) => s.queryPosition);
   const selectQuery = useTraceStore((s) => s.selectQuery);
+  const steps = useTraceStore((s) => s.steps);
+  const currentStep = useTraceStore((s) => s.currentStep);
+  const selectStep = useTraceStore((s) => s.selectStep);
   const selectedBlock = useTraceStore((s) => s.selectedBlock);
   const selectedHead = useTraceStore((s) => s.selectedHead);
   const selectHead = useTraceStore((s) => s.selectHead);
@@ -67,6 +73,9 @@ export function App() {
   // comes up blank with no useful error. Selections here are all stable
   // references into the store, so only the derivation needs memoizing.
   const nextToken = useMemo(() => deriveNextToken(useTraceStore.getState()), [trace]);
+  const samplingTrace =
+    currentStep >= 0 ? steps[currentStep]?.trace ?? null : trace;
+  const panelNextToken = currentStep >= 0 && !samplingTrace ? null : nextToken;
 
   return (
     <div className="mx-auto flex min-h-full max-w-[1500px] flex-col gap-3 p-3">
@@ -162,21 +171,30 @@ export function App() {
 
           <section className="panel" aria-label="Sampling">
             <header className="panel-header">
-              <h2 className="panel-title">{nextToken ? 'Sample' : 'Next token'}</h2>
+              <h2 className="panel-title">{panelNextToken ? 'Sampling' : 'Next token'}</h2>
               <span className="text-[11px] text-slate-500">
-                {nextToken ? 'after temperature and top-k' : 'top-1 at the last context position'}
+                {samplingTrace?.sampling
+                  ? 'temperature and top-k decision'
+                  : 'top-1 at the last context position'}
               </span>
             </header>
-            {nextToken && (
+            {panelNextToken && (
               <p className="border-b border-ink-800 px-3 py-2 text-xs">
                 <span className="label mr-2">argmax</span>
-                <span className="tnum text-accent-400">{JSON.stringify(nextToken.piece)}</span>
+                <span className="tnum text-accent-400">{JSON.stringify(panelNextToken.piece)}</span>
                 <span className="value ml-2 text-[11px] text-slate-500">
-                  {formatPercent(nextToken.prob, 2)}
+                  {formatPercent(panelNextToken.prob, 2)}
                 </span>
               </p>
             )}
-            <TopKChart trace={trace} />
+            <SamplingFunnel trace={samplingTrace} />
+            <DrawStrip sampling={samplingTrace?.sampling ?? null} />
+            <SamplingStats sampling={samplingTrace?.sampling ?? null} />
+            <SamplingHistory
+              steps={steps}
+              currentStep={currentStep}
+              onSelectStep={selectStep}
+            />
           </section>
         </div>
       </div>

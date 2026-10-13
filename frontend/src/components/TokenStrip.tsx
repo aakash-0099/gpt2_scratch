@@ -1,10 +1,5 @@
 /**
- * The token sequence, with the freshly sampled token marked.
- *
- * This is the loop made visible: the prompt fills the strip, one token is
- * appended per step, and the pipeline animates again over the longer context.
- * The newest token is distinguished by weight and colour rather than by position,
- * because at the end of a strip, position alone is hard to notice.
+ * The token sequence, with each sampled token linked to its generation step.
  */
 
 import { useMemo } from 'react';
@@ -13,31 +8,36 @@ import { AnimatePresence, motion } from 'framer-motion';
 import {
   useTraceStore,
   deriveDisplayTokens,
-  selectCurrentStep,
   selectCurrentTrace,
 } from '@/store/useTraceStore';
 
 export function TokenStrip() {
-  // Select only stable slices, then derive. `useTraceStore(selectCurrentStep)`
-  // returns a reference into the store's own array, so it is snapshot-safe;
-  // `deriveDisplayTokens` allocates, so it must sit behind `useMemo` keyed on
-  // that step. Passing it to the store hook instead re-renders forever and
-  // React throws — see the note on the derivation.
-  const step = useTraceStore(selectCurrentStep);
+  const steps = useTraceStore((s) => s.steps);
+  const currentStep = useTraceStore((s) => s.currentStep);
   const trace = useTraceStore(selectCurrentTrace);
   const queryPosition = useTraceStore((s) => s.queryPosition);
   const selectQuery = useTraceStore((s) => s.selectQuery);
+  const selectStep = useTraceStore((s) => s.selectStep);
   const status = useTraceStore((s) => s.status);
 
-  const tokens = useMemo(() => deriveDisplayTokens(useTraceStore.getState()), [step, trace]);
+  const tokens = useMemo(
+    () => deriveDisplayTokens(useTraceStore.getState()),
+    [steps, currentStep, trace],
+  );
+  const promptLength = tokens.filter((token) => token.generatedStep === null).length;
+  const contextLength =
+    trace?.input_token_ids.length ?? promptLength + Math.max(0, currentStep);
 
   return (
     <TokenStripView
       tokens={tokens}
-      contextLength={trace?.input_token_ids.length ?? 0}
+      contextLength={contextLength}
+      promptLength={promptLength}
+      currentStep={currentStep}
       queryPosition={queryPosition}
       streaming={status === 'running'}
       onSelectQuery={selectQuery}
+      onSelectStep={selectStep}
     />
   );
 }
@@ -45,26 +45,31 @@ export function TokenStrip() {
 export function TokenStripView({
   tokens,
   contextLength,
+  promptLength,
+  currentStep,
   queryPosition,
   streaming,
   onSelectQuery,
+  onSelectStep,
 }: {
-  tokens: { piece: string; isNew: boolean }[];
-  /** Number of leading tokens that came from the trace's context. */
+  tokens: { piece: string; isNew: boolean; generatedStep: number | null }[];
   contextLength: number;
+  promptLength: number;
+  currentStep: number;
   queryPosition: number;
   streaming: boolean;
   onSelectQuery: (position: number) => void;
+  onSelectStep: (step: number) => void;
 }) {
-  const T = contextLength;
+  const contextStart = Math.max(0, promptLength + Math.max(0, currentStep) - contextLength);
 
   return (
     <section className="panel" aria-label="Token sequence">
       <header className="panel-header">
         <h2 className="panel-title">Tokens</h2>
         <span className="value text-[11px] text-slate-500">
-          {T} in context
-          {tokens.length > T ? ` · ${tokens.length - T} generated` : ''}
+          {contextLength} in context
+          {tokens.length > promptLength ? ` · ${tokens.length - promptLength} generated` : ''}
           {streaming && <span className="ml-2 text-accent-500">streaming…</span>}
         </span>
       </header>
@@ -78,10 +83,13 @@ export function TokenStripView({
 
         <AnimatePresence initial={false}>
           {tokens.map((token, i) => {
-            // The trace's context positions are queryable; the appended token is
-            // not, because it has not been through a forward pass yet.
-            const isContext = i < T;
-            const selected = isContext && i === queryPosition;
+            const queryIndex = i - contextStart;
+            const isContext =
+              currentStep >= 0 && queryIndex >= 0 && queryIndex < contextLength;
+            const selected =
+              token.generatedStep === null &&
+              isContext &&
+              queryIndex === queryPosition;
             return (
               <motion.span
                 key={`${i}-${token.piece}`}
@@ -92,12 +100,17 @@ export function TokenStripView({
               >
                 <button
                   type="button"
-                  disabled={!isContext}
-                  onClick={() => onSelectQuery(i)}
+                  disabled={!isContext && token.generatedStep === null}
+                  onClick={() => {
+                    if (token.generatedStep !== null) onSelectStep(token.generatedStep);
+                    else if (isContext) onSelectQuery(queryIndex);
+                  }}
                   title={
-                    isContext
-                      ? `query position ${i} — click to focus attention here`
-                      : 'sampled from the previous step, not yet in a forward pass'
+                    token.generatedStep !== null
+                      ? `generated at step ${token.generatedStep + 1} — click to inspect that sampling step`
+                      : isContext
+                        ? `query position ${queryIndex} — click to focus attention and the logit lens here`
+                        : 'outside the current forward-pass context'
                   }
                   className={[
                     'tnum rounded border px-1.5 py-1 text-xs transition-colors',
@@ -106,7 +119,9 @@ export function TokenStripView({
                       : selected
                         ? 'border-accent-500/70 bg-ink-700 text-accent-400'
                         : 'border-ink-600 bg-ink-800 text-slate-300',
-                    isContext ? 'cursor-pointer hover:border-accent-500/60' : 'cursor-default',
+                    isContext || token.generatedStep !== null
+                      ? 'cursor-pointer hover:border-accent-500/60'
+                      : 'cursor-default',
                   ].join(' ')}
                 >
                   {visible(token.piece)}
@@ -117,10 +132,10 @@ export function TokenStripView({
         </AnimatePresence>
       </div>
 
-      {tokens.some((t) => t.isNew) && (
+      {tokens.some((token) => token.generatedStep !== null) && (
         <p className="border-t border-ink-700 px-3 py-1.5 text-[11px] text-slate-500">
-          <span className="text-accent-400">highlighted</span> token was sampled from the step
-          just shown; it joins the context at the next forward pass.
+          Click a generated token to inspect its step; click a context token to select the
+          attention query and logit-lens position.
         </p>
       )}
     </section>

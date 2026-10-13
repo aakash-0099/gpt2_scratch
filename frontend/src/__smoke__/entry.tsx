@@ -25,7 +25,11 @@ import { HeadSelector } from '@/components/HeadSelector';
 import { LogitLens } from '@/components/LogitLens';
 import { ModeToggle } from '@/components/ModeToggle';
 import { TokenStripView } from '@/components/TokenStrip';
-import { TopKChart } from '@/components/TopKChart';
+import { DrawStrip } from '@/components/sampling/DrawStrip';
+import { SamplingFunnel } from '@/components/sampling/SamplingFunnel';
+import { SamplingHistory } from '@/components/sampling/SamplingHistory';
+import { SamplingStats } from '@/components/sampling/SamplingStats';
+import { formatCompact } from '@/lib/format';
 import {
   useTraceStore,
   deriveDisplayTokens,
@@ -85,14 +89,23 @@ function assertTrace(label: string, trace: Trace): void {
   }
   check(`${label}: upper triangle is exactly zero`, masked);
 
-  check(`${label}: lens has one entry per block`, trace.logit_lens.length === trace.blocks.length);
+  check(`${label}: lens includes embedding and every block`, trace.logit_lens.length === trace.blocks.length + 1);
   check(
     `${label}: deepest lens equals the real prediction`,
-    trace.logit_lens[trace.logit_lens.length - 1].top_tokens[0] === trace.top_tokens[0],
+    trace.logit_lens[trace.logit_lens.length - 1].positions[
+      trace.logit_lens[trace.logit_lens.length - 1].positions.length - 1
+    ].top_tokens[0] === trace.top_tokens[0],
   );
-  check(`${label}: sampling candidates sum to ~1`, near(sum(trace.sampling?.candidates.map((c) => c.prob) ?? []), 1, 2e-3));
-  check(`${label}: sampled token is in the candidate set`, (trace.sampling?.candidates ?? []).some((c) => c.token_id === trace.sampling?.sampled_token_id));
-  check(`${label}: lens top_pieces length matches top_tokens`, trace.logit_lens.every((e) => e.top_pieces.length === e.top_tokens.length));
+  check(`${label}: kept sampling candidates sum to ~1`, near(sum((trace.sampling?.candidates ?? []).filter((c) => c.kept).map((c) => c.p_final)), 1, 2e-3));
+  check(`${label}: chosen token is in the candidate set`, (trace.sampling?.candidates ?? []).some((c) => c.id === trace.sampling?.chosen.id));
+  check(
+    `${label}: lens top-three covers every position`,
+    trace.logit_lens.every(
+      (entry) =>
+        entry.positions.length === trace.input_token_ids.length &&
+        entry.positions.every((position) => position.top_pieces.length === 3),
+    ),
+  );
 }
 
 function sum(values: number[]): number {
@@ -217,17 +230,29 @@ check('arcs render one path per unmasked key', (arcsHtml.match(/<path/g) ?? []).
 check('arcs name the query', arcsHtml.includes(`query ${T - 1}`));
 
 const lensHtml = renderToString(<LogitLens trace={trace} />);
-check('lens renders one row per layer', (lensHtml.match(/title="open block /g) ?? []).length === trace.blocks.length);
+check('lens renders the embedding and block rows', (lensHtml.match(/title="open block /g) ?? []).length === trace.blocks.length);
 // React splits adjacent text nodes with comment markers, so assert on the
 // deepest row's real top piece rather than on a composed label.
 check(
   'lens marks the final row with the real prediction',
-  lensHtml.includes(trace.logit_lens[trace.logit_lens.length - 1].top_pieces[0]),
+  lensHtml.includes(
+    trace.logit_lens[trace.logit_lens.length - 1].positions[
+      trace.logit_lens[trace.logit_lens.length - 1].positions.length - 1
+    ].top_pieces[0],
+  ),
 );
 
-const topkHtml = renderToString(<TopKChart trace={trace} />);
-check('top-k chart highlights the sampled token', topkHtml.includes('sampled'));
-check('top-k chart reports the temperature', topkHtml.includes('temperature'));
+const samplingHtml = renderToString(<SamplingFunnel trace={trace} />);
+check('sampling funnel shows all three probability stages', ['Raw', 'Temperature', 'Final'].every((label) => samplingHtml.includes(label)));
+check('sampling funnel exposes logits on hover', samplingHtml.includes('title="logit:'));
+const drawHtml = renderToString(<DrawStrip sampling={trace.sampling} />);
+check('draw strip reports the inverse-CDF draw', trace.sampling?.u === null || drawHtml.includes('landed in'));
+const statsHtml = renderToString(<SamplingStats sampling={trace.sampling} />);
+check('sampling stats include selected-token probability and entropy', statsHtml.includes('p_final') && statsHtml.includes('entropy raw'));
+const historyHtml = renderToString(
+  <SamplingHistory steps={bundle.steps} currentStep={0} onSelectStep={() => {}} />,
+);
+check('sampling history lists generation steps', historyHtml.includes('Sampling history') && historyHtml.includes('p_final'));
 
 const detailHtml = renderToString(
   <BlockDetailView
@@ -243,7 +268,8 @@ check('block detail lists the six sublayers', ['LayerNorm 1', 'Add 1', 'LayerNor
 const topNeuron = block.mlp_hidden.top[T - 1][0];
 check(
   'block detail shows the strongest mlp neuron',
-  detailHtml.includes(String(topNeuron.index)) && detailHtml.includes(String(topNeuron.value)),
+  detailHtml.includes(String(topNeuron.index)) &&
+    detailHtml.includes(formatCompact(topNeuron.value, 3)),
   `neuron ${topNeuron.index} = ${topNeuron.value}`,
 );
 
@@ -254,17 +280,21 @@ check('head selector renders every head', (headSelHtml.match(/aria-pressed/g) ??
 
 const stripHtml = renderToString(
   <TokenStripView
-    tokens={trace.tokens.map((t) => ({ piece: t.piece, isNew: false })).concat([
-      { piece: bundle.steps.at(-1)!.piece, isNew: true },
-    ])}
+    tokens={[
+      ...trace.tokens.map((t) => ({ piece: t.piece, isNew: false, generatedStep: null })),
+      { piece: bundle.steps.at(-1)!.piece, isNew: true, generatedStep: 0 },
+    ]}
     contextLength={T}
+    promptLength={T}
+    currentStep={0}
     queryPosition={T - 1}
     streaming={false}
     onSelectQuery={() => {}}
+    onSelectStep={() => {}}
   />,
 );
 check('token strip renders context tokens', stripHtml.includes('Every'));
-check('token strip marks the sampled token', stripHtml.includes('highlighted'));
+check('token strip links generated tokens to their step', stripHtml.includes('generated at step 1'));
 
 const compareHtml = renderToString(<ComparePanel />);
 check('compare panel degrades without a backend', compareHtml.includes('loading registry'));

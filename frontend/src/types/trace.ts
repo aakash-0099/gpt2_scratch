@@ -16,8 +16,8 @@
  *   and residuals arrive as `VectorSeries`: per-position L2 norms plus 2D PCA
  *   coordinates. See `docs/trace-schema.md` for why.
  * - Every `VectorSeries` in one trace shares a single PCA basis, so their
- *   `explained_variance` values are identical and their `pca` points live in
- *   the same coordinate frame. Plot them together directly.
+ *   `pca` points live in the same coordinate frame. `explained_variance`
+ *   reports each tensor's variance captured by those shared axes.
  * - Attention matrices are causal: `weights[i][j]` is 0 whenever `j > i`, and
  *   rows sum to 1. Upper triangle is structurally empty, not merely small.
  * - All numbers are already rounded to 4 decimals (attention to float16
@@ -58,6 +58,8 @@ export interface VectorSeries {
   shape: number[];
   /** Length 2. Variance captured by each PCA axis, in [0, 1]. */
   explained_variance: number[];
+  /** Norm change from the actual stage input; null for non-block activations. */
+  delta_norms: number[] | null;
 }
 
 /** One of the strongest activations in the MLP hidden layer. */
@@ -125,14 +127,25 @@ export interface BlockTrace {
   resid_after_mlp: VectorSeries;
 }
 
-/** Predictions read out of the residual stream at one block depth. */
-export interface LogitLensEntry {
-  /** Block index, `0 .. n_layers - 1`. */
-  layer: number;
+/** Top lens tokens at one prompt position. */
+export interface LogitLensPosition {
+  position: number;
   top_tokens: number[];
   top_pieces: string[];
-  /** Softmax probabilities at the last prompt position, descending. */
   top_probs: number[];
+}
+
+/** Predictions read out of the residual stream at one depth. */
+export interface LogitLensEntry {
+  /** `"emb"` or block number, `1 .. n_layers`. */
+  layer: number | 'emb';
+  /** One top-3 prediction record per position in the trace context. */
+  positions: LogitLensPosition[];
+  /** Probability/rank of the final layer's last-position argmax at this depth. */
+  final_token_prob: number;
+  final_token_rank: number;
+  /** Entropy of this layer's last-position lens distribution. */
+  entropy: number;
 }
 
 /** The model's real top-1 next-token prediction at one prompt position. */
@@ -143,20 +156,35 @@ export interface PositionPrediction {
   prob: number;
 }
 
-/** One surviving candidate in the sampling step's distribution. */
+/** One candidate in the visible portion of the sampling distribution. */
 export interface SamplingCandidate {
-  token_id: number;
-  piece: string;
+  rank: number;
+  id: number;
+  token: string;
   logit: number;
-  prob: number;
+  p_raw: number;
+  p_temp: number;
+  kept: boolean;
+  p_final: number;
+}
+
+export interface SamplingTail {
+  p_raw: number;
+  p_temp: number;
+}
+
+export interface ChosenToken {
+  rank: number;
+  id: number;
+  token: string;
+  p_raw: number;
+  p_final: number;
 }
 
 /**
  * The sampling decision made after one forward pass.
  *
- * `candidates` hold probabilities recomputed *after* temperature scaling, i.e.
- * exactly the distribution the token was drawn from, so they sum to 1 over the
- * filtered set.
+ * Each candidate records its raw, temperature-scaled, and final probability.
  */
 export interface SamplingStep {
   /** 0-based generation step. */
@@ -165,12 +193,20 @@ export interface SamplingStep {
   temperature: number;
   /** `null` disables top-k filtering. */
   top_k: number | null;
-  /** `true` when `temperature <= 0` (argmax was used). */
-  greedy: boolean;
+  /** Seed passed to the per-generation random generator. */
+  seed: number | null;
   candidates: SamplingCandidate[];
-  sampled_token_id: number;
-  sampled_piece: string;
-  sampled_prob: number;
+  tail: SamplingTail;
+  topk_mass_kept: number;
+  entropy_raw: number;
+  entropy_final: number;
+  /** Random draw, null for temperature 0. */
+  u: number | null;
+  cdf_lo: number | null;
+  cdf_hi: number | null;
+  chosen: ChosenToken;
+  greedy_id: number;
+  was_argmax: boolean;
   /** `null` if EOS handling is disabled. */
   eos_id: number | null;
   /** `true` when this step sampled EOS and generation stopped. */
@@ -208,7 +244,7 @@ export interface Trace {
   top_pieces: string[];
   top_probs: number[];
 
-  /** Exactly `config.n_layers`; the last entry equals the real prediction. */
+  /** `config.n_layers + 1`: summed embedding plus every block output. */
   logit_lens: LogitLensEntry[];
   /** `null` unless the trace came from streaming generation. */
   sampling: SamplingStep | null;

@@ -234,7 +234,7 @@ def test_trace_has_null_sampling(client):
 def test_trace_logit_lens_matches_block_count(client):
     ids = get_tokenizer().encode(PROMPT)
     body = client.post("/api/trace", json={"model_id": MODEL_ID_OPENAI, "token_ids": ids}).json()
-    assert len(body["logit_lens"]) == body["config"]["n_layers"]
+    assert len(body["logit_lens"]) == body["config"]["n_layers"] + 1
     assert len(body["blocks"][0]["heads"]) == body["config"]["n_heads"]
 
 
@@ -257,7 +257,7 @@ def test_trace_respects_mlp_top_k(client):
     ).json()
     assert body["blocks"][0]["mlp_hidden"]["top_k"] == 5
     assert all(len(row) == 5 for row in body["blocks"][0]["mlp_hidden"]["top"])
-    assert len(body["logit_lens"][0]["top_tokens"]) == 3
+    assert len(body["logit_lens"][0]["positions"][0]["top_tokens"]) == 3
 
 
 def test_trace_rejects_empty_token_ids(client):
@@ -606,8 +606,8 @@ def test_stream_trace_with_sampling_validates(raw_stream_trace):
     parsed = TraceModel.model_validate(raw_stream_trace)
     assert parsed.sampling is not None
     assert parsed.sampling.step == 0
-    assert parsed.sampling.greedy is False
-    assert len(parsed.sampling.candidates) == 12
+    assert parsed.sampling.was_argmax is False
+    assert len(parsed.sampling.candidates) == 50
 
 
 def test_plain_trace_has_null_sampling(raw_trace):
@@ -616,14 +616,18 @@ def test_plain_trace_has_null_sampling(raw_trace):
 
 def test_logit_lens_matches_config(raw_trace):
     parsed = TraceModel.model_validate(raw_trace)
-    assert len(parsed.logit_lens) == parsed.config["n_layers"]
-    assert [e.layer for e in parsed.logit_lens] == list(range(parsed.config["n_layers"]))
+    assert len(parsed.logit_lens) == parsed.config["n_layers"] + 1
+    assert [e.layer for e in parsed.logit_lens] == [
+        "emb", *range(1, parsed.config["n_layers"] + 1)
+    ]
 
 
 def test_last_lens_entry_equals_top_tokens(raw_trace):
     parsed = TraceModel.model_validate(raw_trace)
-    assert parsed.logit_lens[-1].top_tokens == parsed.top_tokens
-    assert parsed.logit_lens[-1].top_pieces == parsed.top_pieces
+    final_position = parsed.logit_lens[-1].positions[-1]
+    assert final_position.top_tokens == parsed.top_tokens[:3]
+    assert final_position.top_pieces == parsed.top_pieces[:3]
+    assert parsed.logit_lens[-1].final_token_rank == 1
 
 
 def test_position_predictions_cover_prompt(raw_trace):
@@ -650,23 +654,19 @@ def test_embedding_series_have_uniform_shape(raw_trace):
         assert series.shape == [1, t, parsed.config["emb_dim"]]
 
 
-def test_shared_pca_basis_across_trace(raw_trace):
-    """explained_variance must be identical everywhere: one basis per trace."""
+def test_pca_variance_is_per_tensor(raw_trace):
+    """Shared PCA axes should produce tensor-specific explained variance."""
     parsed = TraceModel.model_validate(raw_trace)
-    baseline = parsed.token_emb.explained_variance
-    others = [
-        parsed.pos_emb.explained_variance,
-        parsed.emb_sum.explained_variance,
-        parsed.final_norm.explained_variance,
+    values = [
+        tuple(getattr(parsed.blocks[0], name).explained_variance)
+        for name in (
+            "ln1_out",
+            "resid_after_attn",
+            "ln2_out",
+            "resid_after_mlp",
+        )
     ]
-    for block in parsed.blocks:
-        others += [
-            block.ln1_out.explained_variance,
-            block.ln2_out.explained_variance,
-            block.resid_after_attn.explained_variance,
-            block.resid_after_mlp.explained_variance,
-        ]
-    assert all(o == baseline for o in others)
+    assert len(set(values)) > 1
 
 
 def test_mlp_hidden_top_k(raw_trace):
@@ -748,7 +748,7 @@ def test_trace_request_defaults():
     req = TraceRequest(token_ids=[1, 2, 3])
     assert req.model_id == "openai-124m"
     assert req.mlp_top_k == 20
-    assert req.lens_top_k == 5
+    assert req.lens_top_k == 3
 
 
 def test_trace_request_rejects_empty_tokens():
@@ -793,14 +793,24 @@ def test_tokenize_request_rejects_oversized_text():
 
 def test_documented_sampling_example_validates():
     example = {
-        "step": 0, "temperature": 0.9, "top_k": 50, "greedy": False,
+        "step": 0, "temperature": 0.9, "top_k": 50, "seed": 193,
         "candidates": [
-            {"token_id": 2011, "piece": " forward", "logit": 6.2031, "prob": 0.196}
+            {
+                "rank": 1, "id": 2011, "token": " forward", "logit": 6.2031,
+                "p_raw": 0.196, "p_temp": 0.181, "kept": True, "p_final": 0.196,
+            }
         ],
-        "sampled_token_id": 2011, "sampled_piece": " forward",
-        "sampled_prob": 0.196, "eos_id": 50256, "eos_hit": False,
+        "tail": {"p_raw": 0.12, "p_temp": 0.18},
+        "topk_mass_kept": 0.82, "entropy_raw": 4.82, "entropy_final": 2.39,
+        "u": 0.137, "cdf_lo": 0.0, "cdf_hi": 0.196,
+        "chosen": {
+            "rank": 1, "id": 2011, "token": " forward",
+            "p_raw": 0.196, "p_final": 0.196,
+        },
+        "greedy_id": 2011, "was_argmax": True,
+        "eos_id": 50256, "eos_hit": False,
     }
-    assert SamplingStep.model_validate(example).sampled_token_id == 2011
+    assert SamplingStep.model_validate(example).chosen.id == 2011
 
 
 def test_documented_vector_series_example_validates():

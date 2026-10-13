@@ -1,11 +1,8 @@
 /**
  * The internals of one transformer block: LN → Attention → Add → LN → MLP → Add.
  *
- * Every value here is read from the trace, not recomputed. The residual add is
- * the one place a derived number appears: `Δ = resid_after − ln_in` is computed
- * client-side from two shipped vectors' norms, because the raw 768-wide vectors
- * are never transmitted (see docs/trace-schema.md). Where a number cannot be
- * recovered client-side the panel says so rather than inventing one.
+ * Every value here is read from the trace, including stage deltas computed by
+ * the backend against each operation's actual input.
  */
 
 import { motion } from 'framer-motion';
@@ -82,7 +79,6 @@ export function BlockDetailView({
           formula="y = (x − μ) / σ · g + b"
           note="normalizes the residual stream before attention"
           series={block.ln1_out}
-          prev={trace.emb_sum}
           position={last}
         />
 
@@ -93,7 +89,6 @@ export function BlockDetailView({
           formula="x = x + Attention(LN1(x))"
           note="residual merge; the stream keeps its pre-attention information"
           series={block.resid_after_attn}
-          prev={block.ln1_out}
           position={last}
         />
 
@@ -102,7 +97,6 @@ export function BlockDetailView({
           formula="y = (x − μ) / σ · g + b"
           note="normalizes again before the MLP"
           series={block.ln2_out}
-          prev={block.resid_after_attn}
           position={last}
         />
 
@@ -113,7 +107,6 @@ export function BlockDetailView({
           formula="x = x + MLP(LN2(x))"
           note="block output, and the block's contribution to the final logit"
           series={block.resid_after_mlp}
-          prev={block.ln2_out}
           position={last}
         />
       </ol>
@@ -130,23 +123,17 @@ function StageRow({
   formula,
   note,
   series,
-  prev,
   position,
 }: {
   label: string;
   formula: string;
   note: string;
   series: VectorSeries;
-  /** The input to this step, used for the delta column. */
-  prev: VectorSeries | null;
   position: number;
 }) {
   const norms = series.norms;
   const here = norms[position] ?? 0;
-  const before = prev ? (prev.norms[position] ?? 0) : null;
-  const delta = before === null ? null : here - before;
-  // `explained_variance` is shared across the whole trace (one PCA basis), so
-  // showing it here describes every other series in the panel too.
+  const delta = series.delta_norms?.[position];
   const ev = series.explained_variance;
 
   return (
@@ -159,7 +146,7 @@ function StageRow({
 
       <div className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-1 text-[11px]">
         <Metric label={`‖x @ ${position}`} value={formatCompact(here)} strong />
-        {delta !== null && (
+        {delta !== undefined && (
           <Metric label="Δ vs input" value={`${delta >= 0 ? '+' : ''}${formatCompact(delta)}`} />
         )}
         <Metric label="mean ‖·‖" value={formatCompact(mean(norms))} />

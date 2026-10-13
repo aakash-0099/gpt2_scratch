@@ -43,7 +43,7 @@ If you change a field here, change it in both.
   "top_pieces":   [" forward", " to", " along", ".", ","],
   "top_probs":    [0.196, 0.1186, 0.0642, 0.0311, 0.0204],
 
-  "logit_lens": [ /* LogitLensEntry, length n_layers */ ],
+  "logit_lens": [ /* LogitLensEntry, length n_layers + 1 */ ],
   "sampling":   null   // or SamplingStep, when produced by generate_stream
 }
 ```
@@ -65,7 +65,7 @@ If you change a field here, change it in both.
 | `top_tokens` | `number[]` | Top-5 at the last position, descending by probability |
 | `top_pieces` | `string[]` | Decoded pieces, parallel to `top_tokens` |
 | `top_probs` | `number[]` | Softmax probabilities over the full vocabulary |
-| `logit_lens` | `LogitLensEntry[]` | Exactly `n_layers`, one per block depth |
+| `logit_lens` | `LogitLensEntry[]` | Exactly `n_layers + 1`, summed embedding plus each block |
 | `sampling` | `SamplingStep \| null` | `null` unless produced by `generate_stream` |
 
 `logits` holds the full `[1, T, vocab_size]` tensor only as **statistics**; the
@@ -97,7 +97,8 @@ trace appears as one of these.
   "norms": [15.1815, 15.8803, 16.3209, 17.0851],
   "pca":   [[8.5169, -5.9978], [-5.094, -9.8302], [7.9445, 9.2975], [-11.4876, 6.2953]],
   "shape": [1, 4, 768],
-  "explained_variance": [0.9854, 0.0066]
+  "explained_variance": [0.9854, 0.0066],
+  "delta_norms": null
 }
 ```
 
@@ -106,19 +107,25 @@ trace appears as one of these.
 | `norms` | `number[]` | Per-position L2 norm, length `T` |
 | `pca` | `number[][]` | Per-position `[x, y]`, length `T`, in the trace's shared basis |
 | `shape` | `number[]` | Source tensor shape, always `[1, T, emb_dim]` |
-| `explained_variance` | `number[]` | Length 2. Variance captured by each PCA axis, in `[0, 1]` |
+| `explained_variance` | `number[]` | Length 2. This tensor's variance captured by each shared PCA axis, in `[0, 1]` |
+| `delta_norms` | `number[] \| null` | Per-position norm change from the block stage's actual input; `null` for non-block series |
 
 **The PCA basis is fitted once per trace** over the pooled activations of
 `token_emb`, `pos_emb`, `emb_sum`, every `ln1_out` / `resid_after_attn` /
 `ln2_out` / `resid_after_mlp`, and `final_norm`. Every `VectorSeries` therefore
-shares the same `explained_variance` values and the same coordinate frame, so a
-point from block 0 and a point from block 11 are directly comparable in one view.
+shares the same coordinate frame, so a point from block 0 and a point from
+block 11 are directly comparable in one view. Explained variance is computed
+independently for each tensor against those shared axes.
 
 Note on scale: residual norms grow with depth (roughly 5 → 430 for GPT-2 124M),
 so the leading component is dominated by deep residual directions and
-early-layer points cluster near the origin. `explained_variance[0]` is typically
-`0.985`. This is a real property of the residual stream; scale per-layer in the
-UI if you want early-layer detail.
+early-layer points cluster near the origin. The explained variance varies by tensor, even though all tensors use the shared
+PCA coordinate frame.
+
+For block stage deltas, `ln1_out` and `resid_after_attn` compare to the block
+input residual (`emb_sum` for block 0, otherwise the previous block's
+`resid_after_mlp`); `ln2_out` and `resid_after_mlp` compare to
+`resid_after_attn`.
 
 ---
 
@@ -229,38 +236,40 @@ There is no `sample` field: all raw values are excluded from the payload.
 
 ## `LogitLensEntry`
 
-Predictions obtained by reading the residual stream out early, by applying the
-model's own `final_norm` and `out_head` to a block's `resid_after_mlp`.
+Each layer applies the model's `final_norm` and `out_head` to the summed
+embedding (`"emb"`) or that block's `resid_after_mlp`. Top-three predictions
+are stored at every prompt position. The final-token metrics always refer to
+the actual layer-`n_layers` argmax at the final prompt position.
 
 ```jsonc
 {
   "layer": 8,
-  "top_tokens": [664, 664, 1404],
-  "top_pieces": [" toward", " towards", " into"],
-  "top_probs":  [0.0721, 0.0611, 0.0338]
+  "positions": [
+    { "position": 0, "top_tokens": [664, 1404, 13],
+      "top_pieces": [" toward", " into", "."], "top_probs": [0.0721, 0.0611, 0.0338] }
+  ],
+  "final_token_prob": 0.0831,
+  "final_token_rank": 4,
+  "entropy": 5.7912
 }
 ```
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `layer` | `number` | Block index `0..n_layers-1` |
-| `top_tokens` | `number[]` | Top-5 ids at the **last** prompt position |
-| `top_pieces` | `string[]` | Decoded pieces |
-| `top_probs` | `number[]` | Softmax probabilities, descending |
+| `layer` | `"emb" \| number` | Summed embedding or block number `1..n_layers` |
+| `positions` | `LogitLensPosition[]` | Top-three tokens/probabilities for positions `0..T-1` |
+| `final_token_prob` | `number` | Probability of the final block's last-position argmax at this layer |
+| `final_token_rank` | `number` | Rank of that same token at this layer (`1` is top) |
+| `entropy` | `number` | Entropy at this layer's last prompt position |
 
-- Length is exactly `n_layers` (there is no entry for the embedding stage).
-- **The last entry equals the model's real prediction**: `logit_lens[n_layers-1].top_tokens == top_tokens`.
-- Only the last prompt position is evaluated, so the lens costs `n_layers`
-  matmuls against the vocabulary rather than `n_layers * T`.
+`LogitLensPosition` is `{ position, top_tokens, top_pieces, top_probs }`;
+the three arrays are descending by probability. There are exactly
+`n_layers + 1` entries: `"emb"` followed by blocks 1 through `n_layers`. The
+final entry's last-position top-three values equal the actual final model
+distribution's top three; its `final_token_rank` is 1.
 
-On real GPT-2 124M weights with the prompt `"Every effort moves you"`, the lens
-shows genuine depth-wise progression:
-
-```
-L 0..L 7  ["'re", "'ve", "'ll"]      contractions
-L 8..L10  [" toward", " towards"]   prepositions
-L11       [" forward", " to"]       the correct continuation
-```
+The lens is an approximation at early layers: the output head was trained to
+read the final layer, so early guesses can be rough or overconfident.
 
 ---
 
@@ -290,13 +299,26 @@ Only present when the trace came from `generate_stream`.
   "step": 0,
   "temperature": 0.9,
   "top_k": 50,
-  "greedy": false,
+  "seed": 193,
   "candidates": [
-    { "token_id": 2011, "piece": " forward", "logit": 6.2031, "prob": 0.196 }
+    {
+      "rank": 1, "id": 2011, "token": " forward", "logit": 6.2031,
+      "p_raw": 0.196, "p_temp": 0.181, "kept": true, "p_final": 0.196
+    }
   ],
-  "sampled_token_id": 2011,
-  "sampled_piece": " forward",
-  "sampled_prob": 0.196,
+  "tail": { "p_raw": 0.12, "p_temp": 0.18 },
+  "topk_mass_kept": 0.82,
+  "entropy_raw": 4.82,
+  "entropy_final": 2.39,
+  "u": 0.137,
+  "cdf_lo": 0.0,
+  "cdf_hi": 0.196,
+  "chosen": {
+    "rank": 1, "id": 2011, "token": " forward",
+    "p_raw": 0.196, "p_final": 0.196
+  },
+  "greedy_id": 2011,
+  "was_argmax": true,
   "eos_id": 50256,
   "eos_hit": false
 }
@@ -305,23 +327,35 @@ Only present when the trace came from `generate_stream`.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `step` | `number` | 0-based generation step |
-| `temperature` | `number` | Applied temperature; `<= 0` means greedy |
+| `temperature` | `number` | Applied temperature; `0` means greedy |
 | `top_k` | `number \| null` | `null` disables top-k filtering |
-| `greedy` | `boolean` | `true` when `temperature <= 0` (argmax was used) |
-| `candidates` | `SamplingCandidate[]` | The top-k filtered set, probabilities **after** temperature scaling |
-| `sampled_token_id` | `number` | The token actually chosen |
-| `sampled_piece` | `string` | Its decoded piece |
-| `sampled_prob` | `number` | Its probability in the sampled-from distribution |
+| `seed` | `number \| null` | Seed used for this generation's local random generator |
+| `candidates` | `SamplingCandidate[]` | Candidates ordered by descending raw logit |
+| `tail` | `{ p_raw, p_temp }` | Raw and temperature-scaled mass beyond listed candidates |
+| `topk_mass_kept` | `number` | `p_temp` mass of tokens retained by top-k, before renormalization |
+| `entropy_raw` / `entropy_final` | `number` | Entropy of the full raw and final sampling distributions |
+| `u` | `number \| null` | Uniform random draw; `null` for temperature 0 |
+| `cdf_lo` / `cdf_hi` | `number \| null` | Chosen token's half-open CDF interval; `null` when no draw |
+| `chosen` | `ChosenToken` | Selected token, rank and its raw/final probabilities |
+| `greedy_id` | `number` | Highest-logit token before sampling |
+| `was_argmax` | `boolean` | Whether the selected token equals `greedy_id` |
 | `eos_id` | `number \| null` | EOS token id, or `null` if disabled |
 | `eos_hit` | `boolean` | `true` when this step sampled EOS |
 
-`SamplingCandidate` is `{ "token_id", "piece", "logit", "prob" }`.
+`SamplingCandidate` contains `{ rank, id, token, logit, p_raw, p_temp, kept,
+p_final }`. `p_raw` is softmax over unmodified logits; `p_temp` is softmax over
+the full vocabulary after temperature; `p_final` is softmax after applying the
+top-k mask and temperature. Non-kept candidates have `p_final: 0`.
 
-- `candidates` length is `top_k` when set, otherwise 10.
-- `prob` values are recomputed **after** `logits / temperature`, so they sum to
-  `1.0` over the filtered set. They are the distribution the token was drawn from.
-- `greedy` steps still report `candidates` (the filtered distribution) for
-  context; `sampled_token_id` then equals the highest-probability candidate.
+- `candidates` lists the top `max(top_k, 50)` logits (capped at vocabulary
+  size). When top-k is disabled, all vocabulary tokens are listed so the
+  complete final distribution and chosen CDF slice remain observable.
+- For positive temperature, `u` is drawn from the local seeded generator and
+  the chosen token is the first token in descending `p_final` order whose CDF
+  exceeds `u`. Temperature zero is deterministic: `u` and CDF bounds are null,
+  and `p_final` is a one-hot argmax distribution.
+- Candidates remain logit-ranked for display; `cdf_lo` and `cdf_hi` describe
+  the chosen token's interval in descending `p_final` order.
 - EOS is **not** appended to the token sequence, since it terminates generation.
 
 ---
@@ -387,7 +421,7 @@ Request:
 
 ```jsonc
 { "model_id": "openai-124m", "token_ids": [6109, 3626, 6100, 345],
-  "mlp_top_k": 20, "lens_top_k": 5 }
+  "mlp_top_k": 20, "lens_top_k": 3 }
 ```
 
 Response: a `Trace`.

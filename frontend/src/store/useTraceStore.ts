@@ -38,6 +38,7 @@ export interface TraceState {
   text: string;
   modelId: string;
   prompt: string;
+  maxNewTokens: number | null;
 
   /** Bumped on every reset so sources can drop state from a previous run. */
   runId: number;
@@ -45,19 +46,21 @@ export interface TraceState {
   replayName: string | null;
   replayMeta: ReplayMeta | null;
 
-  /** Index into `steps` currently displayed. Equals `steps.length - 1` live. */
+  /** Index into `steps` currently displayed. */
   currentStep: number;
   selectedBlock: number | null;
   selectedHead: number;
   /** Query row highlighted in the attention views. */
   queryPosition: number;
+  /** Lens position selected from the token strip; null defaults the lens to the final position. */
+  selectedPosition: number | null;
   /** Whether the block detail drawer is open. */
   detailOpen: boolean;
 
   // --- actions ------------------------------------------------------------ //
   setMode: (mode: Mode) => void;
   reset: (patch?: Partial<Pick<TraceState, 'mode' | 'status' | 'error' | 'modelId' | 'prompt' | 'replayName' | 'replayMeta'>>) => void;
-  startRun: (init: { modelId: string; prompt: string; replayName?: string; replayMeta?: ReplayMeta | null }) => void;
+  startRun: (init: { modelId: string; prompt: string; maxNewTokens?: number; replayName?: string; replayMeta?: ReplayMeta | null }) => void;
   pushStep: (step: WSStepMessage) => void;
   setStatus: (status: SourceStatus, error?: string | null) => void;
   setSteps: (steps: WSStepMessage[]) => void;
@@ -65,6 +68,7 @@ export interface TraceState {
   selectBlock: (index: number | null) => void;
   selectHead: (head: number) => void;
   selectQuery: (position: number) => void;
+  selectStep: (index: number) => void;
   setDetailOpen: (open: boolean) => void;
 }
 
@@ -76,10 +80,26 @@ export interface TraceState {
  * nowhere in another. Clamping here means callers never render an out-of-range
  * index.
  */
-function clampSelections(state: TraceState, steps: WSStepMessage[]): Partial<TraceState> {
-  const trace = latestTrace(steps);
+function traceAtStep(steps: WSStepMessage[], stepIndex: number): Trace | null {
+  for (let index = Math.min(stepIndex, steps.length - 1); index >= 0; index -= 1) {
+    if (steps[index]?.trace) return steps[index].trace;
+  }
+  return stepIndex < 0 ? latestTrace(steps) : null;
+}
+
+function clampSelections(
+  state: TraceState,
+  steps: WSStepMessage[],
+  stepIndex: number,
+): Partial<TraceState> {
+  const trace = traceAtStep(steps, stepIndex);
   if (!trace) {
-    return { selectedBlock: null, selectedHead: 0, queryPosition: 0 };
+    return {
+      selectedBlock: null,
+      selectedHead: 0,
+      queryPosition: 0,
+      selectedPosition: null,
+    };
   }
   const nHeads = trace.blocks[0]?.heads.length ?? 1;
   const T = trace.input_token_ids.length;
@@ -90,6 +110,10 @@ function clampSelections(state: TraceState, steps: WSStepMessage[]): Partial<Tra
         : 0,
     selectedHead: clampInt(state.selectedHead, 0, nHeads - 1),
     queryPosition: clampInt(state.queryPosition, 0, T - 1),
+    selectedPosition:
+      state.selectedPosition === null
+        ? null
+        : clampInt(state.selectedPosition, 0, T - 1),
   };
 }
 
@@ -106,6 +130,7 @@ const initialState = {
   text: '',
   modelId: '',
   prompt: '',
+  maxNewTokens: null,
   runId: 0,
   replayName: null as string | null,
   replayMeta: null as ReplayMeta | null,
@@ -113,6 +138,7 @@ const initialState = {
   selectedBlock: 0,
   selectedHead: 0,
   queryPosition: 0,
+  selectedPosition: null as number | null,
   detailOpen: false,
 };
 
@@ -136,7 +162,9 @@ export const useTraceStore = create<TraceState>((set, get) => ({
       error: null,
       steps: [],
       text: '',
+      maxNewTokens: null,
       currentStep: -1,
+      selectedPosition: null,
       runId: get().runId + 1,
     });
   },
@@ -149,7 +177,7 @@ export const useTraceStore = create<TraceState>((set, get) => ({
       runId: state.runId + 1,
     })),
 
-  startRun: ({ modelId, prompt, replayName, replayMeta }) =>
+  startRun: ({ modelId, prompt, maxNewTokens, replayName, replayMeta }) =>
     set((state) => ({
       steps: [],
       text: '',
@@ -157,43 +185,64 @@ export const useTraceStore = create<TraceState>((set, get) => ({
       status: 'loading',
       modelId,
       prompt,
+      maxNewTokens: maxNewTokens ?? replayMeta?.params?.max_new_tokens ?? null,
       replayName: replayName ?? null,
       replayMeta: replayMeta ?? null,
       currentStep: -1,
       detailOpen: false,
       runId: state.runId + 1,
       // Re-select a sensible head/position for the new trace's shape.
-      ...clampSelections({ ...state, selectedBlock: 0, selectedHead: 0, queryPosition: 0 }, []),
+      ...clampSelections({
+        ...state,
+        selectedBlock: 0,
+        selectedHead: 0,
+        queryPosition: 0,
+        selectedPosition: null,
+      }, [], -1),
     })),
 
   pushStep: (step) =>
     set((state) => {
       const steps = [...state.steps, step];
-      // Replaying in reverse: keep currentStep pinned at the newest step.
-      const currentStep = steps.length - 1;
+      const followsLatest =
+        state.currentStep < 0 || state.currentStep === state.steps.length - 1;
+      const currentStep = followsLatest ? steps.length - 1 : state.currentStep;
       return {
         steps,
         text: step.text || state.text,
         currentStep,
         status: step.finished ? 'done' : state.status,
-        ...clampSelections(state, steps),
+        ...clampSelections(state, steps, currentStep),
       };
     }),
 
   /** Bulk-load a whole bundle at once (used when replay jumps to the end). */
   setSteps: (steps) =>
-    set((state) => ({
-      steps,
-      text: steps.length ? steps[steps.length - 1].text : '',
-      currentStep: steps.length - 1,
-      ...clampSelections(state, steps),
-    })),
+    set((state) => {
+      const currentStep = steps.length - 1;
+      return {
+        steps,
+        text: steps.length ? steps[currentStep].text : '',
+        currentStep,
+        ...clampSelections(state, steps, currentStep),
+      };
+    }),
 
   setStatus: (status, error = null) => set({ status, error }),
 
   selectBlock: (index) => set({ selectedBlock: index, detailOpen: index !== null }),
   selectHead: (head) => set({ selectedHead: head }),
-  selectQuery: (position) => set({ queryPosition: position }),
+  selectQuery: (position) =>
+    set({ queryPosition: position, selectedPosition: position }),
+  selectStep: (index) =>
+    set((state) => {
+      const currentStep =
+        state.steps.length === 0 ? -1 : clampInt(index, 0, state.steps.length - 1);
+      return {
+        currentStep,
+        ...clampSelections(state, state.steps, currentStep),
+      };
+    }),
   setDetailOpen: (detailOpen) => set({ detailOpen }),
 }));
 
@@ -210,14 +259,13 @@ export function selectCurrentStep(state: TraceState): WSStepMessage | null {
 /**
  * The trace backing the current view.
  *
- * Prefers the displayed step's own trace. Falls back to the newest trace of any
- * step, because a step streamed with `trace: false` still has to render
- * something and the previous step's numbers are the honest fallback.
+ * Prefers the displayed step's own trace. When that step was sent without a
+ * trace, use the nearest preceding traced step rather than showing future data.
  */
 export function selectCurrentTrace(state: TraceState): Trace | null {
   const current = selectCurrentStep(state);
   if (current?.trace) return current.trace;
-  return latestTrace(state.steps);
+  return traceAtStep(state.steps, state.currentStep);
 }
 
 export function selectStages(state: TraceState): PipelineStage[] {
@@ -274,23 +322,32 @@ export function selectSelectedHead(state: TraceState) {
  * `selectNextToken` below, and for any future derivation added here.
  */
 export function deriveDisplayTokens(state: TraceState): DisplayToken[] {
-  const step = selectCurrentStep(state);
-  const trace = selectCurrentTrace(state);
-  if (step) {
-    const pieces = trace ? trace.tokens.map((t) => t.piece) : step.token_ids.map(() => '?');
-    // `step.token_ids` includes the freshly sampled token; the trace context
-    // does not, so the difference is exactly one new token at the end.
-    return [
-      ...pieces.map((piece) => ({ piece, isNew: false })),
-      { piece: step.piece, isNew: true },
-    ];
-  }
-  return (trace?.tokens ?? []).map((t) => ({ piece: t.piece, isNew: false }));
+  const firstTrace = state.steps.find((step) => step.trace)?.trace ?? null;
+  const promptLength =
+    firstTrace?.input_token_ids.length ??
+    Math.max(0, (state.steps[0]?.token_ids.length ?? 0) - 1);
+  const promptPieces = firstTrace
+    ? firstTrace.tokens.map((token) => token.piece)
+    : Array.from({ length: promptLength }, () => '?');
+  return [
+    ...promptPieces.map((piece) => ({
+      piece,
+      isNew: false,
+      generatedStep: null,
+    })),
+    ...state.steps.map((step, index) => ({
+      piece: step.piece,
+      isNew: index === state.currentStep,
+      generatedStep: index,
+    })),
+  ];
 }
 
 /** One entry in the token strip. */
 export interface DisplayToken {
   piece: string;
-  /** True for the token sampled from the step currently shown. */
+  /** True for the generated token associated with the selected step. */
   isNew: boolean;
+  /** Index of the generation step that produced this token, or null for prompt tokens. */
+  generatedStep: number | null;
 }

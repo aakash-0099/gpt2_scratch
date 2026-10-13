@@ -234,7 +234,8 @@ Per forward pass, at batch size 1:
   `resid_after_attn`, `ln2_out`, the `mlp_hidden` summary, `resid_after_mlp`
 - `final_norm` and `logits`
 - the real top-1 prediction at every prompt position
-- a logit-lens entry per block depth
+- a logit-lens entry for the summed embedding and each block depth, at every
+  prompt position
 
 Tracing requires batch size 1 and raises `ValueError` otherwise; the schema is
 defined per single sequence.
@@ -252,9 +253,9 @@ the entire depth-wise trajectory in one view rather than normalizing per layer.
 
 One honest caveat, documented in the schema: residual norms grow with depth
 (roughly 5 → 430 for GPT-2 124M), so the leading component is dominated by deep
-residual directions, `explained_variance[0]` is typically `0.985`, and
-early-layer points cluster near the origin. That is a real property of the
-residual stream, not a bug.
+residual directions and early-layer points cluster near the origin. Explained
+variance is measured independently for each tensor along the shared PCA axes;
+those fractions are expected to differ by activation.
 
 ### Precision
 
@@ -267,13 +268,14 @@ applied on top for compactness.
 
 ### Logit lens
 
-`logit_lens` takes each block's `resid_after_mlp`, applies the model's own
-`final_norm` and `out_head`, and records the top-5 tokens **at the last prompt
-position only**. Restricting to one position costs `n_layers` matmuls against
-the 50,257-row vocabulary rather than `n_layers * T`.
+`logit_lens` applies the model's own `final_norm` and `out_head` to the summed
+embedding and each block's `resid_after_mlp`. It records the top-three tokens
+and probabilities at every prompt position; each entry also summarizes the
+final predicted token's probability, rank, and entropy at the last position.
+This costs `(n_layers + 1) * T` vocabulary readouts.
 
-The deepest entry (`layer == n_layers - 1`) is exactly the model's real
-prediction, and the test suite asserts it equals `trace.top_tokens`. On real
+The final entry (block `n_layers`) matches the model's actual top-three
+probabilities at every position, and its `final_token_rank` is 1. On real
 124M weights the lens shows genuine depth-wise progression:
 
 ```

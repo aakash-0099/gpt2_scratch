@@ -162,6 +162,7 @@ export function useReplay(): Replay {
         startRun({
           modelId: doc.model_id,
           prompt: doc.prompt,
+          maxNewTokens: doc.params.max_new_tokens,
           replayName: doc.name,
           replayMeta: { name: doc.name, params: doc.params, intervalMs },
         });

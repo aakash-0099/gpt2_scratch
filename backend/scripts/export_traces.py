@@ -86,6 +86,9 @@ def export_one(
         last_text = ""
 
         for step in generator:
+            trace_payload = step.trace.to_dict() if step.trace is not None else None
+            if trace_payload is not None and trace_payload["sampling"] is None:
+                raise ValueError("A traced generation step is missing its sampling record")
             payload = WSStepMessage(
                 request_id=name,
                 step=step.sampling.step if step.sampling is not None else len(steps),
@@ -94,7 +97,7 @@ def export_one(
                 token_ids=step.token_ids,
                 text=step.text,
                 finished=step.finished,
-                trace=step.trace.to_dict() if step.trace is not None else None,
+                trace=trace_payload,
             ).model_dump()
             steps.append(payload)
             if step.trace is not None:

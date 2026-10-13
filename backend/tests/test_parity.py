@@ -456,8 +456,8 @@ def test_logit_lens_last_depth_matches_real_prediction():
         logits = model(inp)
 
     real_top = torch.topk(logits[0, -1], k=5).indices.tolist()
-    assert trace.logit_lens[-1].top_tokens == [int(t) for t in real_top]
-    assert trace.logit_lens[-1].top_tokens == trace.top_tokens
+    assert trace.logit_lens[-1].positions[-1].top_tokens == [int(t) for t in real_top[:3]]
+    assert trace.logit_lens[-1].positions[-1].top_tokens == trace.top_tokens[:3]
 
 
 @pytest.mark.slow
@@ -468,9 +468,9 @@ def test_logit_lens_varies_with_depth():
     inp = torch.tensor([tok.encode(PROMPT)], dtype=torch.long)
     trace = model.forward(inp, return_trace=True, tokenizer=tok, model_id="openai-124m")
 
-    all_top = [tuple(e.top_tokens) for e in trace.logit_lens]
+    all_top = [tuple(e.positions[-1].top_tokens) for e in trace.logit_lens]
     assert len(set(all_top)) > 1, "logit lens is constant across depth"
-    assert len(trace.logit_lens) == 12
+    assert len(trace.logit_lens) == 13
 
 
 @pytest.mark.slow
