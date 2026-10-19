@@ -8,7 +8,6 @@ venv/
 
 # Model weights and checkpoints
 backend/checkpoints/
-gpt2/
 models/
 *.pt
 *.pth
