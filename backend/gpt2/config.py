@@ -21,6 +21,41 @@ GPT_CONFIG_124M = {
     "qkv_bias": True,  # Query-key-value bias
 }
 
+# The three larger checkpoints OpenAI published alongside 124M. All of them keep
+# the 124M vocabulary and context length; only depth, width and head count grow
+# (the classic GPT-2 table). They exist as configs because the model is built
+# from a config *before* the matching checkpoint is downloaded, and
+# ``load_weights_into_gpt`` asserts the two agree.
+GPT_CONFIG_355M = {
+    "vocab_size": 50257,
+    "context_length": 1024,
+    "emb_dim": 1024,
+    "n_heads": 16,
+    "n_layers": 24,
+    "drop_rate": 0.1,
+    "qkv_bias": True,
+}
+
+GPT_CONFIG_774M = {
+    "vocab_size": 50257,
+    "context_length": 1024,
+    "emb_dim": 1280,
+    "n_heads": 20,
+    "n_layers": 36,
+    "drop_rate": 0.1,
+    "qkv_bias": True,
+}
+
+GPT_CONFIG_1558M = {
+    "vocab_size": 50257,
+    "context_length": 1024,
+    "emb_dim": 1600,
+    "n_heads": 25,
+    "n_layers": 48,
+    "drop_rate": 0.1,
+    "qkv_bias": True,
+}
+
 # A much smaller variant with the same architecture, used for fast tests, for the
 # "scratch-10ep" demo model, and anywhere a full 124M forward pass is wasteful.
 # Vocabulary and tokenizer are identical to GPT-2 so traces stay comparable.
@@ -33,6 +68,28 @@ GPT_CONFIG_SMALL = {
     "drop_rate": 0.1,
     "qkv_bias": True,
 }
+
+# Which architecture goes with which published checkpoint size.
+MODEL_CONFIGS = {
+    "124M": GPT_CONFIG_124M,
+    "355M": GPT_CONFIG_355M,
+    "774M": GPT_CONFIG_774M,
+    "1558M": GPT_CONFIG_1558M,
+}
+
+
+def get_model_config(model_size: str) -> dict:
+    """Return the architecture config matching a published checkpoint size.
+
+    Raises ``ValueError`` for sizes OpenAI never published, so a typo fails
+    immediately instead of after a multi-gigabyte download.
+    """
+    try:
+        return MODEL_CONFIGS[model_size]
+    except KeyError:
+        raise ValueError(
+            f"Model size {model_size!r} not in {ALLOWED_MODEL_SIZES}"
+        ) from None
 
 # Default hyperparameters for the from-scratch training run (see scripts/train_small.py).
 SMALL_RUN_CONFIG = {
